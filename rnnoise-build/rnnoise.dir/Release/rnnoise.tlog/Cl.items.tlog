@@ -1,7 +1,0 @@
-D:\Projects\VoIP\rnnoise\src\celt_lpc.c;D:\Projects\VoIP\rnnoise-build\rnnoise.dir\Release\celt_lpc.obj
-D:\Projects\VoIP\rnnoise\src\denoise.c;D:\Projects\VoIP\rnnoise-build\rnnoise.dir\Release\denoise.obj
-D:\Projects\VoIP\rnnoise\src\kiss_fft.c;D:\Projects\VoIP\rnnoise-build\rnnoise.dir\Release\kiss_fft.obj
-D:\Projects\VoIP\rnnoise\src\pitch.c;D:\Projects\VoIP\rnnoise-build\rnnoise.dir\Release\pitch.obj
-D:\Projects\VoIP\rnnoise\src\rnn.c;D:\Projects\VoIP\rnnoise-build\rnnoise.dir\Release\rnn.obj
-D:\Projects\VoIP\rnnoise\src\rnn_data.c;D:\Projects\VoIP\rnnoise-build\rnnoise.dir\Release\rnn_data.obj
-D:\Projects\VoIP\rnnoise\src\rnn_reader.c;D:\Projects\VoIP\rnnoise-build\rnnoise.dir\Release\rnn_reader.obj

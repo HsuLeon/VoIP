@@ -31,10 +31,12 @@
 #include "VoIP/Codec.h"
 #include "VoIP/Network.h"
 #include "VoIP/Mix.h"
+#include <rnnoise.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -205,6 +207,9 @@ struct Channel::Impl {
     AudioDevice   audio;
     Encoder       encoder;
     Mixer         mixer{FRAME_SAMPLES};
+    DenoiseState* denoiseState = nullptr;
+    std::vector<float> denoiseInBuf;
+    std::vector<float> denoiseOutBuf;
     std::vector<int16_t> captureBuf;   // 收音幀累積緩衝
     std::mutex           captureMtx;
     std::vector<int16_t> mixBuf = std::vector<int16_t>(FRAME_SAMPLES, 0); // 960 個零元素；in-class initializer 不支援括號語法，改用 = 賦值形式
@@ -233,6 +238,53 @@ struct Channel::Impl {
         std::chrono::steady_clock::now(); // 初始化為現在，避免啟動即觸發
 
     // ── 捕獲音訊（miniaudio 執行緒呼叫）─────────────────────
+    bool initDenoise() {
+        shutdownDenoise();
+        if (!config.enableDenoise) return true;
+
+        const int rnnoiseFrame = rnnoise_get_frame_size();
+        if (rnnoiseFrame <= 0 || (FRAME_SAMPLES % rnnoiseFrame) != 0)
+            return false;
+
+        denoiseState = rnnoise_create(nullptr);
+        if (!denoiseState) return false;
+
+        denoiseInBuf.resize(static_cast<size_t>(rnnoiseFrame));
+        denoiseOutBuf.resize(static_cast<size_t>(rnnoiseFrame));
+        return true;
+    }
+
+    void shutdownDenoise() {
+        if (denoiseState) {
+            rnnoise_destroy(denoiseState);
+            denoiseState = nullptr;
+        }
+        denoiseInBuf.clear();
+        denoiseOutBuf.clear();
+    }
+
+    void applyDenoise(int16_t* pcm, int samples) {
+        if (!denoiseState || !pcm || samples <= 0) return;
+
+        const int rnnoiseFrame = rnnoise_get_frame_size();
+        if (rnnoiseFrame <= 0 || (samples % rnnoiseFrame) != 0) return;
+
+        for (int offset = 0; offset < samples; offset += rnnoiseFrame) {
+            for (int i = 0; i < rnnoiseFrame; ++i)
+                denoiseInBuf[static_cast<size_t>(i)] =
+                    static_cast<float>(pcm[offset + i]);
+
+            rnnoise_process_frame(denoiseState, denoiseOutBuf.data(),
+                                  denoiseInBuf.data());
+
+            for (int i = 0; i < rnnoiseFrame; ++i) {
+                float sample = denoiseOutBuf[static_cast<size_t>(i)];
+                sample = std::clamp(sample, -32768.0f, 32767.0f);
+                pcm[offset + i] = static_cast<int16_t>(std::lround(sample));
+            }
+        }
+    }
+
     void handleCapture(const int16_t* pcm, int samples) {
         if (muted || !running.load()) return;
 
@@ -251,7 +303,11 @@ struct Channel::Impl {
                 ++dbgCapture; // 每幀都計數（噪音閘前）
 
                 // ── 軟體噪音閘：低於門檻直接丟棄，不呼叫 Opus encode ─────
-                if (!AudioDevice::detectVoice(captureBuf.data(), FRAME_SAMPLES,
+                int16_t frame[FRAME_SAMPLES];
+                std::copy_n(captureBuf.begin(), FRAME_SAMPLES, frame);
+                applyDenoise(frame, FRAME_SAMPLES);
+
+                if (!AudioDevice::detectVoice(frame, FRAME_SAMPLES,
                                               -40.0f)) {
                     captureBuf.erase(captureBuf.begin(),
                                      captureBuf.begin() + FRAME_SAMPLES);
@@ -259,7 +315,7 @@ struct Channel::Impl {
                 }
 
                 uint8_t opus[1500];
-                int len = encoder.encode(captureBuf.data(), FRAME_SAMPLES, opus, 1500);
+                int len = encoder.encode(frame, FRAME_SAMPLES, opus, 1500);
                 captureBuf.erase(captureBuf.begin(),
                                   captureBuf.begin() + FRAME_SAMPLES);
 
@@ -440,7 +496,7 @@ Channel::Channel() : m_impl(new Impl) {
                     | static_cast<uint32_t>(rand());
 }
 
-Channel::~Channel() { leave(); delete m_impl; }
+Channel::~Channel() { leave(); m_impl->shutdownDenoise(); delete m_impl; }
 
 bool Channel::join(const ChannelConfig& cfg, const ChannelEvents& events) {
     if (m_impl->joined) leave();
@@ -459,6 +515,10 @@ bool Channel::join(const ChannelConfig& cfg, const ChannelEvents& events) {
     }
     if (!m_impl->encoder.init(SAMPLE_RATE, CHANNELS, OPUS_BITRATE_DEFAULT)) {
         if (events.onError) events.onError("Encoder init failed");
+        WSACleanup(); return false;
+    }
+    if (!m_impl->initDenoise()) {
+        if (events.onError) events.onError("RNNoise init failed");
         WSACleanup(); return false;
     }
 
@@ -650,6 +710,7 @@ void Channel::leave() {
     }
 
     m_impl->audio.shutdown();
+    m_impl->shutdownDenoise();
     WSACleanup();
 }
 

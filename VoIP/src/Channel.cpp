@@ -276,7 +276,7 @@ struct Channel::Impl {
         shutdownEchoCancel();
         if (!config.enableEchoCancel) return true;
 
-        constexpr int FILTER_MS = 120;
+        constexpr int FILTER_MS = 200;
         const int filterLength = SAMPLE_RATE * FILTER_MS / 1000;
 
         echoState = speex_echo_state_init_mc(

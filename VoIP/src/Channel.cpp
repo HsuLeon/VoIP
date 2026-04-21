@@ -859,6 +859,13 @@ void Channel::tick() {
             }
 
             // 從 jitter buffer 取一幀解碼
+            if (peer.useTurn &&
+                !peer.publicIp.empty() &&
+                peer.publicPort != 0) {
+                m_impl->udp.send(PUNCH_MAGIC, 4,
+                                 peer.publicIp, peer.publicPort);
+            }
+
             RtpPacket pkt;
             if (!peer.jitter.pop(pkt)) continue;
 

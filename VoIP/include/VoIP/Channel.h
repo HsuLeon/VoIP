@@ -22,6 +22,7 @@ struct ChannelConfig {
     std::string channelId;
     std::string playerId;
     bool        enableDenoise = true;
+    bool        enableEchoCancel = true;
 };
 
 struct ChannelEvents {

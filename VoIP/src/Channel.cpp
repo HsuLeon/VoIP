@@ -32,6 +32,8 @@
 #include "VoIP/Network.h"
 #include "VoIP/Mix.h"
 #include <rnnoise.h>
+#include <speex/speex_echo.h>
+#include <speex/speex_preprocess.h>
 
 #include <algorithm>
 #include <atomic>
@@ -207,13 +209,18 @@ struct Channel::Impl {
     AudioDevice   audio;
     Encoder       encoder;
     Mixer         mixer{FRAME_SAMPLES};
+    SpeexEchoState* echoState = nullptr;
+    SpeexPreprocessState* echoPreprocess = nullptr;
     DenoiseState* denoiseState = nullptr;
+    std::vector<int16_t> echoBuf;
     std::vector<float> denoiseInBuf;
     std::vector<float> denoiseOutBuf;
     uint64_t      lastCaptureGeneration = 0;
+    uint64_t      lastPlaybackGeneration = 0;
     int           captureHangoverFrames = 0;
     std::vector<int16_t> captureBuf;   // 收音幀累積緩衝
     std::mutex           captureMtx;
+    std::mutex           echoMtx;
     std::vector<int16_t> mixBuf = std::vector<int16_t>(FRAME_SAMPLES, 0); // 960 個零元素；in-class initializer 不支援括號語法，改用 = 賦值形式
 
     // RTP 發送狀態
@@ -265,6 +272,88 @@ struct Channel::Impl {
         denoiseOutBuf.clear();
     }
 
+    bool initEchoCancel() {
+        shutdownEchoCancel();
+        if (!config.enableEchoCancel) return true;
+
+        constexpr int FILTER_MS = 200;
+        const int filterLength = SAMPLE_RATE * FILTER_MS / 1000;
+
+        echoState = speex_echo_state_init_mc(
+            FRAME_SAMPLES, filterLength, CHANNELS, CHANNELS);
+        if (!echoState) return false;
+
+        int sampleRate = SAMPLE_RATE;
+        speex_echo_ctl(echoState, SPEEX_ECHO_SET_SAMPLING_RATE, &sampleRate);
+
+        echoPreprocess =
+            speex_preprocess_state_init(FRAME_SAMPLES, SAMPLE_RATE);
+        if (!echoPreprocess) {
+            speex_echo_state_destroy(echoState);
+            echoState = nullptr;
+            return false;
+        }
+
+        int denoise = 0;
+        int vad = 0;
+        int agc = 0;
+        int echoSuppress = -40;
+        int echoSuppressActive = -15;
+        speex_preprocess_ctl(
+            echoPreprocess, SPEEX_PREPROCESS_SET_DENOISE, &denoise);
+        speex_preprocess_ctl(
+            echoPreprocess, SPEEX_PREPROCESS_SET_VAD, &vad);
+        speex_preprocess_ctl(
+            echoPreprocess, SPEEX_PREPROCESS_SET_AGC, &agc);
+        speex_preprocess_ctl(
+            echoPreprocess, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS,
+            &echoSuppress);
+        speex_preprocess_ctl(
+            echoPreprocess, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS_ACTIVE,
+            &echoSuppressActive);
+        speex_preprocess_ctl(
+            echoPreprocess, SPEEX_PREPROCESS_SET_ECHO_STATE, echoState);
+
+        echoBuf.resize(FRAME_SAMPLES);
+        return true;
+    }
+
+    void shutdownEchoCancel() {
+        if (echoPreprocess) {
+            speex_preprocess_state_destroy(echoPreprocess);
+            echoPreprocess = nullptr;
+        }
+        if (echoState) {
+            speex_echo_state_destroy(echoState);
+            echoState = nullptr;
+        }
+        echoBuf.clear();
+    }
+
+    void resetEchoCancel() {
+        if (!config.enableEchoCancel) return;
+        std::lock_guard<std::mutex> lk(echoMtx);
+        shutdownEchoCancel();
+        initEchoCancel();
+    }
+
+    void registerPlaybackReference(const int16_t* pcm, int samples) {
+        if (!echoState || !pcm || samples != FRAME_SAMPLES) return;
+        std::lock_guard<std::mutex> lk(echoMtx);
+        if (!echoState) return;
+        speex_echo_playback(echoState, pcm);
+    }
+
+    void applyEchoCancel(int16_t* pcm, int samples) {
+        if (!echoState || !pcm || samples != FRAME_SAMPLES) return;
+        std::lock_guard<std::mutex> lk(echoMtx);
+        if (!echoState || echoBuf.size() != FRAME_SAMPLES) return;
+        speex_echo_capture(echoState, pcm, echoBuf.data());
+        if (echoPreprocess)
+            speex_preprocess_run(echoPreprocess, echoBuf.data());
+        std::copy(echoBuf.begin(), echoBuf.end(), pcm);
+    }
+
     void applyDenoise(int16_t* pcm, int samples) {
         if (!denoiseState || !pcm || samples <= 0) return;
 
@@ -300,6 +389,7 @@ struct Channel::Impl {
                 captureBuf.clear();
                 captureHangoverFrames = 0;
                 lastCaptureGeneration = captureGen;
+                resetEchoCancel();
             }
 
             // 噪音閘門檻（dB）：低於此值的幀視為噪音，直接丟棄不編碼
@@ -313,6 +403,7 @@ struct Channel::Impl {
                 // ── 軟體噪音閘：低於門檻直接丟棄，不呼叫 Opus encode ─────
                 int16_t frame[FRAME_SAMPLES];
                 std::copy_n(captureBuf.begin(), FRAME_SAMPLES, frame);
+                applyEchoCancel(frame, FRAME_SAMPLES);
                 applyDenoise(frame, FRAME_SAMPLES);
 
                 const bool activeNow =
@@ -526,7 +617,12 @@ Channel::Channel() : m_impl(new Impl) {
                     | static_cast<uint32_t>(rand());
 }
 
-Channel::~Channel() { leave(); m_impl->shutdownDenoise(); delete m_impl; }
+Channel::~Channel() {
+    leave();
+    m_impl->shutdownEchoCancel();
+    m_impl->shutdownDenoise();
+    delete m_impl;
+}
 
 bool Channel::join(const ChannelConfig& cfg, const ChannelEvents& events) {
     if (m_impl->joined) leave();
@@ -549,6 +645,10 @@ bool Channel::join(const ChannelConfig& cfg, const ChannelEvents& events) {
     }
     if (!m_impl->initDenoise()) {
         if (events.onError) events.onError("RNNoise init failed");
+        WSACleanup(); return false;
+    }
+    if (!m_impl->initEchoCancel()) {
+        if (events.onError) events.onError("Speex AEC init failed");
         WSACleanup(); return false;
     }
 
@@ -698,6 +798,7 @@ bool Channel::join(const ChannelConfig& cfg, const ChannelEvents& events) {
     });
 
     // ── Step 9: 啟動收音（miniaudio 非同步執行緒）
+    m_impl->lastPlaybackGeneration = m_impl->audio.playbackGeneration();
     m_impl->audio.startCapture(
         [impl = m_impl](const int16_t* pcm, int n) {
             impl->handleCapture(pcm, n);
@@ -740,6 +841,7 @@ void Channel::leave() {
     }
 
     m_impl->audio.shutdown();
+    m_impl->shutdownEchoCancel();
     m_impl->shutdownDenoise();
     WSACleanup();
 }
@@ -764,6 +866,11 @@ void Channel::tick() {
     if (!m_impl->joined) return;
 
     auto now = std::chrono::steady_clock::now();
+    const uint64_t playbackGen = m_impl->audio.playbackGeneration();
+    if (playbackGen != m_impl->lastPlaybackGeneration) {
+        m_impl->lastPlaybackGeneration = playbackGen;
+        m_impl->resetEchoCancel();
+    }
 
     // ── Debug：每 5 秒列印管線統計 ─────────────────────────
     // 重要：cout 在 Windows CMD 快速編輯模式下可能阻塞（使用者點選視窗選字時）。
@@ -911,6 +1018,7 @@ void Channel::tick() {
 
     // ② 混音並送入播放佇列
     m_impl->mixer.mix(m_impl->mixBuf.data());
+    m_impl->registerPlaybackReference(m_impl->mixBuf.data(), FRAME_SAMPLES);
     m_impl->audio.play(m_impl->mixBuf.data(), FRAME_SAMPLES);
 }
 

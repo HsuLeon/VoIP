@@ -377,6 +377,8 @@ struct Channel::Impl {
                         const std::string& fromIp, uint16_t fromPort)
     {
         if (!running.load() || len < 4) return;
+        const bool fromRelay =
+            (fromIp == serverIp && fromPort == serverRelayPort);
         ++dbgUdpRecv; // 不需要鎖，在 SSRC 比對前就計數，便於診斷 relay 是否到達
 
         // 打洞 magic 封包（不是 RTP）
@@ -385,9 +387,19 @@ struct Channel::Impl {
         {
             std::lock_guard<std::mutex> lk(peersMtx);
             for (auto& [id, p] : peers) {
-                if (!p.punchDone && p.publicIp == fromIp && p.publicPort == fromPort) {
-                    p.punchDone = true;
-                    p.useTurn   = false;
+                const bool matchesKnownEndpoint =
+                    (p.publicIp == fromIp && p.publicPort == fromPort) ||
+                    (p.signaledIp == fromIp && p.signaledPort == fromPort) ||
+                    (p.lastLearnedIp == fromIp &&
+                     p.lastLearnedPort == fromPort);
+                if (!fromRelay && matchesKnownEndpoint) {
+                    p.lastLearnedIp   = fromIp;
+                    p.lastLearnedPort = fromPort;
+                    p.publicIp        = fromIp;
+                    p.publicPort      = fromPort;
+                    p.punchDone       = true;
+                    p.useTurn         = false;
+                    p.punchStart      = std::chrono::steady_clock::now();
                 }
             }
             return;
@@ -407,11 +419,14 @@ struct Channel::Impl {
         if (!peer) return;
 
         // 直連封包 → 確認打洞成功
-        if (!peer->punchDone &&
-            fromIp == peer->publicIp && fromPort == peer->publicPort)
-        {
-            peer->punchDone = true;
-            peer->useTurn   = false;
+        if (!fromRelay) {
+            peer->lastLearnedIp   = fromIp;
+            peer->lastLearnedPort = fromPort;
+            peer->publicIp        = fromIp;
+            peer->publicPort      = fromPort;
+            peer->punchDone       = true;
+            peer->useTurn         = false;
+            peer->punchStart      = std::chrono::steady_clock::now();
         }
 
         // 初始化解碼器

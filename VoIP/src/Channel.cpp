@@ -276,7 +276,7 @@ struct Channel::Impl {
         shutdownEchoCancel();
         if (!config.enableEchoCancel) return true;
 
-        constexpr int FILTER_MS = 120;
+        constexpr int FILTER_MS = 240;
         const int filterLength = SAMPLE_RATE * FILTER_MS / 1000;
 
         echoState = speex_echo_state_init_mc(
@@ -297,8 +297,8 @@ struct Channel::Impl {
         int denoise = 0;
         int vad = 0;
         int agc = 0;
-        int echoSuppress = -55;
-        int echoSuppressActive = -20;
+        int echoSuppress = -50;
+        int echoSuppressActive = -18;
         speex_preprocess_ctl(
             echoPreprocess, SPEEX_PREPROCESS_SET_DENOISE, &denoise);
         speex_preprocess_ctl(

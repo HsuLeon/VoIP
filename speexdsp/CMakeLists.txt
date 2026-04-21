@@ -1,7 +1,18 @@
 cmake_minimum_required(VERSION 3.16)
 project(speexdsp LANGUAGES C)
 
-# Generate speexdsp_config_types.h for Windows x64
+# Generate minimal config.h expected by upstream sources when HAVE_CONFIG_H is set.
+set(GENERATED_CONFIG_H ${CMAKE_CURRENT_BINARY_DIR}/config.h)
+file(WRITE ${GENERATED_CONFIG_H}
+"#ifndef SPEEXDSP_CONFIG_H\n"
+"#define SPEEXDSP_CONFIG_H\n"
+"#define FLOATING_POINT 1\n"
+"#define USE_SMALLFT 1\n"
+"#define EXPORT\n"
+"#endif\n"
+)
+
+# Generate speexdsp_config_types.h for Windows builds
 set(GENERATED_INCLUDE_DIR ${CMAKE_CURRENT_BINARY_DIR}/include/speex)
 file(MAKE_DIRECTORY ${GENERATED_INCLUDE_DIR})
 file(WRITE ${GENERATED_INCLUDE_DIR}/speexdsp_config_types.h
@@ -32,6 +43,7 @@ add_library(speexdsp STATIC
 target_include_directories(speexdsp
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_BINARY_DIR}
         ${CMAKE_CURRENT_BINARY_DIR}/include
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/libspeexdsp

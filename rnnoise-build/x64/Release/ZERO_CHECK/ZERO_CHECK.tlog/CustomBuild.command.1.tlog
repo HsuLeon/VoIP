@@ -1,0 +1,10 @@
+^D:\PROJECTS\VOIP\RNNOISE-BUILD\CMAKEFILES\10774CFCE698CD7630E11FB2696326A3\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/Projects/VoIP/rnnoise -BD:/Projects/VoIP/rnnoise-build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/Projects/VoIP/rnnoise-build/rnnoise.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

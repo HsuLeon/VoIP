@@ -30,6 +30,8 @@ struct AudioDevice::Impl {
     std::mutex          deviceMtx;
     std::atomic<bool>   captureRestartPending{false};
     std::atomic<bool>   playbackRestartPending{false};
+    std::atomic<uint64_t> captureGeneration{0};
+    std::atomic<uint64_t> playbackGeneration{0};
 
     static void maCaptureCb(ma_device* pDevice,
                             void* pOutput,
@@ -120,7 +122,12 @@ bool AudioDevice::restartPlaybackDevice(Impl* impl)
         return false;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(impl->playMtx);
+        impl->playQueue.clear();
+    }
     impl->playbackInitialized = true;
+    ++impl->playbackGeneration;
     return true;
 }
 
@@ -152,6 +159,7 @@ bool AudioDevice::restartCaptureDevice(Impl* impl)
     }
 
     impl->captureInitialized = true;
+    ++impl->captureGeneration;
     return true;
 }
 
@@ -238,6 +246,16 @@ void AudioDevice::play(const int16_t* pcm, int sampleCount)
     }
 
     m_impl->playQueue.insert(m_impl->playQueue.end(), pcm, pcm + sampleCount);
+}
+
+uint64_t AudioDevice::captureGeneration() const
+{
+    return m_impl->captureGeneration.load();
+}
+
+uint64_t AudioDevice::playbackGeneration() const
+{
+    return m_impl->playbackGeneration.load();
 }
 
 bool AudioDevice::detectVoice(const int16_t* pcm, int sampleCount, float thresholdDb)

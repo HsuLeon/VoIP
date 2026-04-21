@@ -210,6 +210,8 @@ struct Channel::Impl {
     DenoiseState* denoiseState = nullptr;
     std::vector<float> denoiseInBuf;
     std::vector<float> denoiseOutBuf;
+    uint64_t      lastCaptureGeneration = 0;
+    int           captureHangoverFrames = 0;
     std::vector<int16_t> captureBuf;   // 收音幀累積緩衝
     std::mutex           captureMtx;
     std::vector<int16_t> mixBuf = std::vector<int16_t>(FRAME_SAMPLES, 0); // 960 個零元素；in-class initializer 不支援括號語法，改用 = 賦值形式
@@ -293,6 +295,12 @@ struct Channel::Impl {
         {
             std::lock_guard<std::mutex> lk(captureMtx);
             captureBuf.insert(captureBuf.end(), pcm, pcm + samples);
+            const uint64_t captureGen = audio.captureGeneration();
+            if (captureGen != lastCaptureGeneration) {
+                captureBuf.clear();
+                captureHangoverFrames = 0;
+                lastCaptureGeneration = captureGen;
+            }
 
             // 噪音閘門檻（dB）：低於此值的幀視為噪音，直接丟棄不編碼
             // -35 dB ≈ max 音量的 1.8%，可過濾鍵盤聲/風扇聲，保留正常說話聲
@@ -307,8 +315,15 @@ struct Channel::Impl {
                 std::copy_n(captureBuf.begin(), FRAME_SAMPLES, frame);
                 applyDenoise(frame, FRAME_SAMPLES);
 
-                if (!AudioDevice::detectVoice(frame, FRAME_SAMPLES,
-                                              -40.0f)) {
+                const bool activeNow =
+                    AudioDevice::detectVoice(frame, FRAME_SAMPLES, -45.0f);
+                if (activeNow) {
+                    captureHangoverFrames = 6;
+                } else if (captureHangoverFrames > 0) {
+                    --captureHangoverFrames;
+                }
+
+                if (!activeNow && captureHangoverFrames <= 0) {
                     captureBuf.erase(captureBuf.begin(),
                                      captureBuf.begin() + FRAME_SAMPLES);
                     continue; // 噪音幀：不編碼，不發送

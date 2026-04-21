@@ -25,6 +25,9 @@ public:
 
     void play(const int16_t* pcm, int sampleCount);
 
+    uint64_t captureGeneration() const;
+    uint64_t playbackGeneration() const;
+
     static bool detectVoice(const int16_t* pcm, int sampleCount, float thresholdDb = -40.0f);
 
 private:

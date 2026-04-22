@@ -28,6 +28,7 @@ struct AudioDevice::Impl {
     std::deque<int16_t> playQueue;
     std::mutex          playMtx;
     std::mutex          deviceMtx;
+    bool                playbackPrimed = false;
     std::atomic<bool>   captureRestartPending{false};
     std::atomic<bool>   playbackRestartPending{false};
     std::atomic<uint64_t> captureGeneration{0};
@@ -64,6 +65,17 @@ struct AudioDevice::Impl {
         }
 
         std::lock_guard<std::mutex> lock(impl->playMtx);
+        constexpr size_t MIN_PRIME =
+            static_cast<size_t>(FRAME_SAMPLES) * CHANNELS * 2;
+
+        if (!impl->playbackPrimed) {
+            if (impl->playQueue.size() < MIN_PRIME) {
+                std::fill(out, out + needed, int16_t{0});
+                return;
+            }
+            impl->playbackPrimed = true;
+        }
+
         for (size_t i = 0; i < needed; ++i) {
             if (!impl->playQueue.empty()) {
                 out[i] = impl->playQueue.front();
@@ -110,6 +122,8 @@ bool AudioDevice::restartPlaybackDevice(Impl* impl)
     impl->playbackConfig.playback.channels        = static_cast<ma_uint32>(CHANNELS);
     impl->playbackConfig.sampleRate               = static_cast<ma_uint32>(SAMPLE_RATE);
     impl->playbackConfig.periodSizeInMilliseconds = static_cast<ma_uint32>(FRAME_MS);
+    impl->playbackConfig.periods                  = 4;
+    impl->playbackConfig.performanceProfile       = ma_performance_profile_conservative;
     impl->playbackConfig.dataCallback             = AudioDevice::Impl::maPlaybackCb;
     impl->playbackConfig.notificationCallback     = AudioDevice::Impl::maNotificationCb;
     impl->playbackConfig.pUserData                = impl;
@@ -125,6 +139,7 @@ bool AudioDevice::restartPlaybackDevice(Impl* impl)
     {
         std::lock_guard<std::mutex> lock(impl->playMtx);
         impl->playQueue.clear();
+        impl->playbackPrimed = false;
     }
     impl->playbackInitialized = true;
     ++impl->playbackGeneration;
@@ -146,6 +161,8 @@ bool AudioDevice::restartCaptureDevice(Impl* impl)
     impl->captureConfig.capture.channels          = static_cast<ma_uint32>(CHANNELS);
     impl->captureConfig.sampleRate                = static_cast<ma_uint32>(SAMPLE_RATE);
     impl->captureConfig.periodSizeInMilliseconds  = static_cast<ma_uint32>(FRAME_MS);
+    impl->captureConfig.periods                   = 4;
+    impl->captureConfig.performanceProfile        = ma_performance_profile_conservative;
     impl->captureConfig.dataCallback              = AudioDevice::Impl::maCaptureCb;
     impl->captureConfig.notificationCallback      = AudioDevice::Impl::maNotificationCb;
     impl->captureConfig.pUserData                 = impl;
@@ -236,7 +253,7 @@ void AudioDevice::play(const int16_t* pcm, int sampleCount)
     std::lock_guard<std::mutex> lock(m_impl->playMtx);
 
     constexpr size_t MAX_QUEUE =
-        static_cast<size_t>(SAMPLE_RATE) * CHANNELS / 2;
+        static_cast<size_t>(SAMPLE_RATE) * CHANNELS;
 
     size_t newTotal = m_impl->playQueue.size() + static_cast<size_t>(sampleCount);
     if (newTotal > MAX_QUEUE) {

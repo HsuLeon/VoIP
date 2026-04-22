@@ -203,36 +203,60 @@ The solution now also includes:
 - `GameClientMock`
   A console project that simulates the future game client and talks to `Client.exe` through local IPC
 
-IPC is currently implemented as:
+IPC is currently implemented as a transport-selectable local channel:
 
-- JSON-over-TCP on `127.0.0.1:17832`
+- JSON message protocol shared across all IPC modes
 - `Client.exe` acts as the local IPC server
 - `GameClientMock.exe` acts as the local IPC client
+- Supported IPC transports:
+  - `socket`
+  - `namedPipe`
 
 ### Client startup behavior
 
 `Client.exe` now supports two startup modes:
 
-- No arguments:
-  Starts in IPC mode only and waits for commands from `GameClientMock` or the future game client
-- Full startup arguments:
-  Automatically joins a voice channel using the provided CLI values
+- IPC mode:
+  Requires `--ipc-type`
+- Direct startup mode:
+  Requires the full set of voice startup arguments
 
-Valid auto-join example:
+IPC mode examples:
+
+```powershell
+Client.exe --ipc-type socket --ipc-port 17832
+Client.exe --ipc-type namedPipe --ipc-name RanOnlineVoIP
+```
+
+Direct startup example:
 
 ```powershell
 Client.exe --server 127.0.0.1:7000 --token test --channel guild_123 --player playerA
 ```
 
-If only part of the required startup arguments is provided, the client prints a warning plus a correct usage example and exits.
+If the required arguments are incomplete or missing, the client prints a correct usage example and exits.
 
 ### GameClientMock usage
 
 Recommended test flow:
 
-1. Start `Client.exe` with no arguments
+1. Start `Client.exe` with an IPC transport
 2. Start `GameClientMock.exe`
 3. Type commands into the `GameClientMock.exe` console and press Enter
+
+Example:
+
+```powershell
+Client.exe --ipc-type socket --ipc-port 17832
+GameClientMock.exe --ipc-type socket --ipc-port 17832
+```
+
+Or:
+
+```powershell
+Client.exe --ipc-type namedPipe --ipc-name RanOnlineVoIP
+GameClientMock.exe --ipc-type namedPipe --ipc-name RanOnlineVoIP
+```
 
 At startup, `GameClientMock.exe` connects to the local IPC port and requests current state automatically.
 

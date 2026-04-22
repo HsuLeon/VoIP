@@ -18,6 +18,70 @@ BOOL WINAPI consoleCtrlHandler(DWORD) {
     return TRUE;
 }
 
+struct Args {
+    bool valid = false;
+    VoIP::IpcOptions ipc;
+};
+
+void printUsage() {
+    std::cerr << "Usage:\n";
+    std::cerr << "  GameClientMock.exe --ipc-type socket [--ipc-port 17832]\n";
+    std::cerr << "  GameClientMock.exe --ipc-type namedPipe [--ipc-name RanOnlineVoIP]\n";
+}
+
+bool parseIpcType(const std::string& text, VoIP::IpcTransport& out) {
+    if (text == "socket") {
+        out = VoIP::IpcTransport::Socket;
+        return true;
+    }
+    if (text == "namedPipe" || text == "namedpipe") {
+        out = VoIP::IpcTransport::NamedPipe;
+        return true;
+    }
+    return false;
+}
+
+std::string transportToText(VoIP::IpcTransport transport) {
+    return transport == VoIP::IpcTransport::Socket ? "socket" : "namedPipe";
+}
+
+Args parseArgs(int argc, char* argv[]) {
+    Args args;
+    for (int i = 1; i < argc; ++i) {
+        const std::string key = argv[i];
+        if (i + 1 >= argc) {
+            continue;
+        }
+
+        const std::string val = argv[i + 1];
+        if (key == "--ipc-type") {
+            if (!parseIpcType(val, args.ipc.transport)) {
+                return args;
+            }
+            args.valid = true;
+            ++i;
+            continue;
+        }
+        if (key == "--ipc-port") {
+            try {
+                const int port = std::stoi(val);
+                if (port > 0 && port <= 65535) {
+                    args.ipc.socketPort = static_cast<uint16_t>(port);
+                }
+            } catch (...) {
+            }
+            ++i;
+            continue;
+        }
+        if (key == "--ipc-name") {
+            args.ipc.pipeName = val;
+            ++i;
+            continue;
+        }
+    }
+    return args;
+}
+
 std::string jsonEscape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 8);
@@ -50,21 +114,35 @@ void printHelp() {
 
 } // namespace
 
-int main() {
+int main(int argc, char* argv[]) {
     SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
+
+    if (argc <= 1) {
+        printUsage();
+        return 1;
+    }
+
+    const Args args = parseArgs(argc, argv);
+    if (!args.valid) {
+        printUsage();
+        return 1;
+    }
 
     std::cout << "========================================\n";
     std::cout << "  GameClientMock\n";
-    std::cout << "  IPC target: 127.0.0.1:" << VoIP::IPC_PORT << "\n";
+    std::cout << "  IPC type : " << transportToText(args.ipc.transport) << "\n";
+    if (args.ipc.transport == VoIP::IpcTransport::Socket) {
+        std::cout << "  Target   : 127.0.0.1:" << args.ipc.socketPort << "\n";
+    } else {
+        std::cout << "  Target   : \\\\.\\pipe\\" << args.ipc.pipeName << "\n";
+    }
     std::cout << "========================================\n";
 
     VoIP::IpcClient ipc;
-    if (!ipc.connect([](const std::string& json) {
+    if (!ipc.connect(args.ipc, [](const std::string& json) {
             std::cout << "[IPC-EVT] " << json << "\n";
         })) {
-        std::cerr << "[ERR] Could not connect to VoIP Client IPC on 127.0.0.1:"
-                  << VoIP::IPC_PORT << "\n";
-        std::cerr << "      Start Client.exe first.\n";
+        std::cerr << "[ERR] Could not connect to VoIP Client IPC.\n";
         return 1;
     }
 
@@ -80,25 +158,20 @@ int main() {
         std::string cmd;
         iss >> cmd;
 
-        if (cmd.empty()) {
-            continue;
-        }
+        if (cmd.empty()) continue;
 
         if (cmd == "help") {
             printHelp();
             continue;
         }
-
         if (cmd == "hello") {
             ipc.send("{\"ver\":1,\"cmd\":\"HELLO\"}");
             continue;
         }
-
         if (cmd == "status") {
             ipc.send("{\"ver\":1,\"cmd\":\"STATUS\"}");
             continue;
         }
-
         if (cmd == "login") {
             std::string playerId;
             std::string token;
@@ -124,7 +197,6 @@ int main() {
             ipc.send(json);
             continue;
         }
-
         if (cmd == "join") {
             std::string channelId;
             iss >> channelId;
@@ -136,12 +208,10 @@ int main() {
             ipc.send(json);
             continue;
         }
-
         if (cmd == "leave") {
             ipc.send("{\"ver\":1,\"cmd\":\"LEAVE\"}");
             continue;
         }
-
         if (cmd == "mute") {
             std::string arg;
             iss >> arg;
@@ -154,17 +224,14 @@ int main() {
             }
             continue;
         }
-
         if (cmd == "toggle-mute") {
             ipc.send("{\"ver\":1,\"cmd\":\"TOGGLE_MUTE\"}");
             continue;
         }
-
         if (cmd == "quit-client") {
             ipc.send("{\"ver\":1,\"cmd\":\"QUIT\"}");
             continue;
         }
-
         if (cmd == "quit" || cmd == "exit") {
             break;
         }

@@ -64,6 +64,14 @@ std::string makePipePath(const std::string& pipeName) {
     return "\\\\.\\pipe\\" + pipeName;
 }
 
+std::string makePipeRxPath(const std::string& pipeName) {
+    return makePipePath(pipeName) + ".c2s";
+}
+
+std::string makePipeTxPath(const std::string& pipeName) {
+    return makePipePath(pipeName) + ".s2c";
+}
+
 bool recvPipeLine(HANDLE pipe, std::string& lineBuf, std::string& remaining) {
     auto pos = remaining.find('\n');
     if (pos != std::string::npos) {
@@ -105,6 +113,24 @@ bool sendPipeAll(HANDLE pipe, const std::string& jsonMsg) {
     return true;
 }
 
+bool openClientPipeWithRetry(const std::string& path, DWORD desiredAccess, HANDLE& outHandle) {
+    for (int i = 0; i < 30; ++i) {
+        if (WaitNamedPipeA(path.c_str(), 200)) {
+            outHandle = CreateFileA(path.c_str(),
+                                    desiredAccess,
+                                    0,
+                                    nullptr,
+                                    OPEN_EXISTING,
+                                    0,
+                                    nullptr);
+            if (outHandle != INVALID_HANDLE_VALUE) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 struct IpcServer::Impl {
@@ -115,7 +141,9 @@ struct IpcServer::Impl {
 
     SOCKET listenSock = INVALID_SOCKET;
     SOCKET clientSock = INVALID_SOCKET;
-    HANDLE pipeHandle = INVALID_HANDLE_VALUE;
+
+    HANDLE pipeRead = INVALID_HANDLE_VALUE;
+    HANDLE pipeWrite = INVALID_HANDLE_VALUE;
 
     std::thread acceptThread;
     std::thread recvThread;
@@ -123,6 +151,7 @@ struct IpcServer::Impl {
 };
 
 IpcServer::IpcServer() : m_impl(new Impl) {}
+
 IpcServer::~IpcServer() {
     stop();
     delete m_impl;
@@ -215,64 +244,82 @@ bool IpcServer::start(const IpcOptions& options, IpcMessageCallback onMessage) {
     }
 
     m_impl->acceptThread = std::thread([this]() {
-        const std::string pipePath = makePipePath(m_impl->options.pipeName);
+        const std::string rxPath = makePipeRxPath(m_impl->options.pipeName);
+        const std::string txPath = makePipeTxPath(m_impl->options.pipeName);
+
         while (m_impl->running.load()) {
-            HANDLE serverPipe = CreateNamedPipeA(
-                pipePath.c_str(),
-                PIPE_ACCESS_DUPLEX,
+            HANDLE readPipe = CreateNamedPipeA(
+                rxPath.c_str(),
+                PIPE_ACCESS_INBOUND,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 1,
                 4096,
                 4096,
                 0,
                 nullptr);
-            if (serverPipe == INVALID_HANDLE_VALUE) {
+            HANDLE writePipe = CreateNamedPipeA(
+                txPath.c_str(),
+                PIPE_ACCESS_OUTBOUND,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                nullptr);
+
+            if (readPipe == INVALID_HANDLE_VALUE || writePipe == INVALID_HANDLE_VALUE) {
+                if (readPipe != INVALID_HANDLE_VALUE) CloseHandle(readPipe);
+                if (writePipe != INVALID_HANDLE_VALUE) CloseHandle(writePipe);
                 break;
+            }
+
+            const BOOL readConnected =
+                ConnectNamedPipe(readPipe, nullptr)
+                    ? TRUE
+                    : (GetLastError() == ERROR_PIPE_CONNECTED ? TRUE : FALSE);
+            const BOOL writeConnected =
+                ConnectNamedPipe(writePipe, nullptr)
+                    ? TRUE
+                    : (GetLastError() == ERROR_PIPE_CONNECTED ? TRUE : FALSE);
+
+            if (!readConnected || !writeConnected || !m_impl->running.load()) {
+                DisconnectNamedPipe(readPipe);
+                DisconnectNamedPipe(writePipe);
+                CloseHandle(readPipe);
+                CloseHandle(writePipe);
+                if (!m_impl->running.load()) break;
+                continue;
             }
 
             {
                 std::lock_guard<std::mutex> lock(m_impl->sendMtx);
-                m_impl->pipeHandle = serverPipe;
-            }
-
-            const BOOL connected =
-                ConnectNamedPipe(serverPipe, nullptr)
-                    ? TRUE
-                    : (GetLastError() == ERROR_PIPE_CONNECTED ? TRUE : FALSE);
-            if (!connected || !m_impl->running.load()) {
-                CloseHandle(serverPipe);
-                {
-                    std::lock_guard<std::mutex> lock(m_impl->sendMtx);
-                    if (m_impl->pipeHandle == serverPipe) {
-                        m_impl->pipeHandle = INVALID_HANDLE_VALUE;
-                    }
-                }
-                if (!m_impl->running.load()) {
-                    break;
-                }
-                continue;
+                m_impl->pipeRead = readPipe;
+                m_impl->pipeWrite = writePipe;
             }
 
             if (m_impl->recvThread.joinable()) {
                 m_impl->recvThread.join();
             }
 
-            m_impl->recvThread = std::thread([this, serverPipe]() {
+            m_impl->recvThread = std::thread([this, readPipe, writePipe]() {
                 std::string remaining;
                 std::string line;
                 while (m_impl->running.load()) {
-                    if (!recvPipeLine(serverPipe, line, remaining)) break;
+                    if (!recvPipeLine(readPipe, line, remaining)) break;
                     if (!line.empty() && m_impl->onMessage) {
                         m_impl->onMessage(line);
                     }
                 }
 
                 std::lock_guard<std::mutex> lock(m_impl->sendMtx);
-                if (m_impl->pipeHandle == serverPipe) {
-                    FlushFileBuffers(serverPipe);
-                    DisconnectNamedPipe(serverPipe);
-                    CloseHandle(serverPipe);
-                    m_impl->pipeHandle = INVALID_HANDLE_VALUE;
+                if (m_impl->pipeRead == readPipe) {
+                    FlushFileBuffers(writePipe);
+                    DisconnectNamedPipe(readPipe);
+                    DisconnectNamedPipe(writePipe);
+                    CloseHandle(readPipe);
+                    CloseHandle(writePipe);
+                    m_impl->pipeRead = INVALID_HANDLE_VALUE;
+                    m_impl->pipeWrite = INVALID_HANDLE_VALUE;
                 }
             });
 
@@ -305,11 +352,16 @@ void IpcServer::stop() {
             closesocket(m_impl->listenSock);
             m_impl->listenSock = INVALID_SOCKET;
         }
-        if (m_impl->pipeHandle != INVALID_HANDLE_VALUE) {
-            FlushFileBuffers(m_impl->pipeHandle);
-            DisconnectNamedPipe(m_impl->pipeHandle);
-            CloseHandle(m_impl->pipeHandle);
-            m_impl->pipeHandle = INVALID_HANDLE_VALUE;
+        if (m_impl->pipeRead != INVALID_HANDLE_VALUE) {
+            DisconnectNamedPipe(m_impl->pipeRead);
+            CloseHandle(m_impl->pipeRead);
+            m_impl->pipeRead = INVALID_HANDLE_VALUE;
+        }
+        if (m_impl->pipeWrite != INVALID_HANDLE_VALUE) {
+            FlushFileBuffers(m_impl->pipeWrite);
+            DisconnectNamedPipe(m_impl->pipeWrite);
+            CloseHandle(m_impl->pipeWrite);
+            m_impl->pipeWrite = INVALID_HANDLE_VALUE;
         }
     }
 
@@ -335,8 +387,8 @@ void IpcServer::send(const std::string& jsonMsg) {
         return;
     }
 
-    if (m_impl->pipeHandle == INVALID_HANDLE_VALUE) return;
-    sendPipeAll(m_impl->pipeHandle, jsonMsg);
+    if (m_impl->pipeWrite == INVALID_HANDLE_VALUE) return;
+    sendPipeAll(m_impl->pipeWrite, jsonMsg);
 }
 
 struct IpcClient::Impl {
@@ -346,12 +398,14 @@ struct IpcClient::Impl {
     std::mutex sendMtx;
 
     SOCKET sock = INVALID_SOCKET;
-    HANDLE pipeHandle = INVALID_HANDLE_VALUE;
+    HANDLE pipeRead = INVALID_HANDLE_VALUE;
+    HANDLE pipeWrite = INVALID_HANDLE_VALUE;
     std::thread recvThread;
     bool wsaStarted = false;
 };
 
 IpcClient::IpcClient() : m_impl(new Impl) {}
+
 IpcClient::~IpcClient() {
     disconnect();
     delete m_impl;
@@ -402,19 +456,10 @@ bool IpcClient::connect(const IpcOptions& options, IpcMessageCallback onEvent) {
         return true;
     }
 
-    const std::string pipePath = makePipePath(options.pipeName);
-    if (!WaitNamedPipeA(pipePath.c_str(), 3000)) {
-        return false;
-    }
-
-    m_impl->pipeHandle = CreateFileA(pipePath.c_str(),
-                                     GENERIC_READ | GENERIC_WRITE,
-                                     0,
-                                     nullptr,
-                                     OPEN_EXISTING,
-                                     0,
-                                     nullptr);
-    if (m_impl->pipeHandle == INVALID_HANDLE_VALUE) {
+    const std::string rxPath = makePipeTxPath(options.pipeName);
+    const std::string txPath = makePipeRxPath(options.pipeName);
+    if (!openClientPipeWithRetry(rxPath, GENERIC_READ, m_impl->pipeRead) ||
+        !openClientPipeWithRetry(txPath, GENERIC_WRITE, m_impl->pipeWrite)) {
         disconnect();
         return false;
     }
@@ -424,7 +469,7 @@ bool IpcClient::connect(const IpcOptions& options, IpcMessageCallback onEvent) {
         std::string remaining;
         std::string line;
         while (m_impl->running.load()) {
-            if (!recvPipeLine(m_impl->pipeHandle, line, remaining)) break;
+            if (!recvPipeLine(m_impl->pipeRead, line, remaining)) break;
             if (!line.empty() && m_impl->onEvent) {
                 m_impl->onEvent(line);
             }
@@ -446,9 +491,13 @@ void IpcClient::disconnect() {
             closesocket(m_impl->sock);
             m_impl->sock = INVALID_SOCKET;
         }
-        if (m_impl->pipeHandle != INVALID_HANDLE_VALUE) {
-            CloseHandle(m_impl->pipeHandle);
-            m_impl->pipeHandle = INVALID_HANDLE_VALUE;
+        if (m_impl->pipeRead != INVALID_HANDLE_VALUE) {
+            CloseHandle(m_impl->pipeRead);
+            m_impl->pipeRead = INVALID_HANDLE_VALUE;
+        }
+        if (m_impl->pipeWrite != INVALID_HANDLE_VALUE) {
+            CloseHandle(m_impl->pipeWrite);
+            m_impl->pipeWrite = INVALID_HANDLE_VALUE;
         }
     }
 
@@ -471,8 +520,8 @@ void IpcClient::send(const std::string& jsonMsg) {
         return;
     }
 
-    if (m_impl->pipeHandle == INVALID_HANDLE_VALUE) return;
-    sendPipeAll(m_impl->pipeHandle, jsonMsg);
+    if (m_impl->pipeWrite == INVALID_HANDLE_VALUE) return;
+    sendPipeAll(m_impl->pipeWrite, jsonMsg);
 }
 
 } // namespace VoIP

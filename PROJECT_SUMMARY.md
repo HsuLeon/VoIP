@@ -258,6 +258,11 @@ Client.exe --ipc-type namedPipe --ipc-name RanOnlineVoIP
 GameClientMock.exe --ipc-type namedPipe --ipc-name RanOnlineVoIP
 ```
 
+Note:
+
+- The public IPC name is the base name such as `RanOnlineVoIP`
+- Internally, the implementation uses separate one-way named pipes for stability, but that detail is hidden from the caller
+
 At startup, `GameClientMock.exe` connects to the local IPC port and requests current state automatically.
 
 Useful commands:

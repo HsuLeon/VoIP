@@ -219,6 +219,7 @@ struct Channel::Impl {
     uint16_t      serverRelayPort = 40000;
     std::string   selfLanIp;
     std::string   selfPublicIp;
+    uint16_t      selfPublicPort = 0;
     uint16_t      selfLocalUdpPort = 0;
 
     // 音訊管線
@@ -240,6 +241,9 @@ struct Channel::Impl {
     std::vector<int16_t> captureBuf;   // 收音幀累積緩衝
     std::mutex           captureMtx;
     std::mutex           echoMtx;
+    std::mutex           sigSendMtx;
+    std::chrono::steady_clock::time_point lastNetworkProbe =
+        std::chrono::steady_clock::now();
     std::vector<int16_t> mixBuf = std::vector<int16_t>(FRAME_SAMPLES, 0); // 960 個零元素；in-class initializer 不支援括號語法，改用 = 賦值形式
 
     // RTP 發送狀態
@@ -278,6 +282,77 @@ struct Channel::Impl {
             peer.publicIp   = peer.lanIp;
             peer.publicPort = peer.lanPort;
         }
+    }
+
+    bool sendSigLine(const std::string& line) {
+        if (sigSock == INVALID_SOCKET) return false;
+        std::lock_guard<std::mutex> lk(sigSendMtx);
+        std::string msg = line + '\n';
+        int sent = ::send(sigSock, msg.c_str(), static_cast<int>(msg.size()), 0);
+        return sent == static_cast<int>(msg.size());
+    }
+
+    void handleNetworkChange() {
+        if (!joined || sigSock == INVALID_SOCKET) return;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(
+                now - lastNetworkProbe).count() < 3)
+            return;
+        lastNetworkProbe = now;
+
+        const std::string newLanIp = getSocketLocalIp(sigSock);
+        const uint16_t newLocalUdpPort = udp.localPort();
+
+        StunResult stunResult;
+        static constexpr const char* kStunServers[] = {
+            "stun.l.google.com",
+            "stun.cloudflare.com"
+        };
+        static constexpr uint16_t kStunPorts[] = {19302, 3478};
+        for (size_t i = 0; i < 2; ++i) {
+            stunResult = udp.queryStun(kStunServers[i], kStunPorts[i]);
+            if (stunResult.success) break;
+        }
+
+        const std::string newPublicIp =
+            stunResult.success ? stunResult.publicIp : selfPublicIp;
+        const uint16_t newPublicPort =
+            stunResult.success ? stunResult.publicPort : selfPublicPort;
+
+        if (newLanIp == selfLanIp &&
+            newPublicIp == selfPublicIp &&
+            newPublicPort == selfPublicPort &&
+            newLocalUdpPort == selfLocalUdpPort) {
+            return;
+        }
+
+        selfLanIp = newLanIp;
+        selfPublicIp = newPublicIp;
+        selfPublicPort = newPublicPort;
+        selfLocalUdpPort = newLocalUdpPort;
+
+        {
+            std::lock_guard<std::mutex> lk(peersMtx);
+            for (auto& [id, peer] : peers) {
+                refreshPeerEndpoint(peer);
+                peer.lastLearnedIp.clear();
+                peer.lastLearnedPort = 0;
+                peer.punchDone = false;
+                peer.useTurn = false;
+                peer.punchStart = now;
+            }
+        }
+
+        const std::string updateMsg = jBuild({
+            {"cmd",        "UPDATE_ADDR"},
+            {"playerId",   config.playerId},
+            {"udpPort",    std::to_string(newLocalUdpPort)},
+            {"lanIp",      newLanIp},
+            {"publicIp",   newPublicIp},
+            {"publicPort", std::to_string(newPublicPort)}
+        });
+        sendSigLine(updateMsg);
     }
 
     bool initDenoise() {
@@ -661,8 +736,7 @@ struct Channel::Impl {
 
         } else if (cmd == "PING") {
             // 回應心跳
-            std::string pong = "{\"cmd\":\"PONG\"}\n";
-            ::send(sigSock, pong.c_str(), static_cast<int>(pong.size()), 0);
+            sendSigLine("{\"cmd\":\"PONG\"}");
         }
     }
 };
@@ -766,8 +840,12 @@ bool Channel::join(const ChannelConfig& cfg, const ChannelEvents& events) {
         if (stunResult.success) break;
     }
     m_impl->selfLocalUdpPort = localUdpPort;
-    if (stunResult.success)
+    if (stunResult.success) {
         m_impl->selfPublicIp = stunResult.publicIp;
+        m_impl->selfPublicPort = stunResult.publicPort;
+    } else {
+        m_impl->selfPublicPort = localUdpPort;
+    }
 
     // ── Step 5: 送出 JOIN
     std::vector<std::pair<std::string, std::string>> joinFields = {
@@ -784,10 +862,9 @@ bool Channel::join(const ChannelConfig& cfg, const ChannelEvents& events) {
         joinFields.push_back({"publicIp", stunResult.publicIp});
         joinFields.push_back({"publicPort", std::to_string(stunResult.publicPort)});
     }
-    std::string joinMsg = jBuild(joinFields) + '\n';
+    std::string joinMsg = jBuild(joinFields);
 
-    if (::send(m_impl->sigSock, joinMsg.c_str(),
-               static_cast<int>(joinMsg.size()), 0) <= 0) {
+    if (!m_impl->sendSigLine(joinMsg)) {
         closesocket(m_impl->sigSock); m_impl->sigSock = INVALID_SOCKET;
         if (events.onError) events.onError("Signaling JOIN send failed");
         WSACleanup(); return false;
@@ -892,9 +969,7 @@ void Channel::leave() {
 
     // 送 LEAVE 並關閉 TCP
     if (m_impl->sigSock != INVALID_SOCKET) {
-        std::string leaveMsg = "{\"cmd\":\"LEAVE\"}\n";
-        ::send(m_impl->sigSock, leaveMsg.c_str(),
-               static_cast<int>(leaveMsg.size()), 0);
+        m_impl->sendSigLine("{\"cmd\":\"LEAVE\"}");
         closesocket(m_impl->sigSock);
         m_impl->sigSock = INVALID_SOCKET;
     }
@@ -940,6 +1015,7 @@ void Channel::tick() {
     if (!m_impl->joined) return;
 
     auto now = std::chrono::steady_clock::now();
+    m_impl->handleNetworkChange();
     const uint64_t playbackGen = m_impl->audio.playbackGeneration();
     if (playbackGen != m_impl->lastPlaybackGeneration) {
         m_impl->lastPlaybackGeneration = playbackGen;

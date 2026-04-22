@@ -377,6 +377,27 @@ static void handleClient(SOCKET clientSock, std::string peerIp) {
                 break;
             } else if (cmd == "PONG") {
                 session->lastPong = std::chrono::steady_clock::now();
+            } else if (cmd == "UPDATE_ADDR") {
+                const uint16_t udpPort =
+                    static_cast<uint16_t>(jInt(line, "udpPort"));
+                const std::string lanIp = jStr(line, "lanIp");
+                const std::string publicIp = jStr(line, "publicIp");
+                const uint16_t publicPort =
+                    static_cast<uint16_t>(jInt(line, "publicPort"));
+
+                if (udpPort != 0) session->localUdpPort = udpPort;
+                if (!lanIp.empty()) session->lanIp = lanIp;
+                if (!publicIp.empty()) session->publicIp = publicIp;
+                if (publicPort != 0) session->publicPort = publicPort;
+
+                std::cout << "[SIG] UPDATE_ADDR player=" << session->playerId
+                          << " lanIp="
+                          << (session->lanIp.empty() ? "-" : session->lanIp)
+                          << " localUdpPort=" << session->localUdpPort
+                          << " public=" << session->publicIp << ":"
+                          << session->publicPort << "\n";
+
+                broadcastPeerAddr(session, session->playerId);
             }
             // 其他指令目前忽略
         }

@@ -451,7 +451,8 @@ struct Channel::Impl {
                     udp.send(rtp.data(), static_cast<int>(rtp.size()),
                              peer.publicIp, peer.publicPort);
                     ++dbgSentDirect;
-                } else if (!sentViaRelay) {
+                }
+                if ((peer.useTurn || !peer.punchDone) && !sentViaRelay) {
                     // Relay：向 server:relayPort 發送裸 RTP，
                     // server 廣播給同頻道其他成員
                     udp.send(rtp.data(), static_cast<int>(rtp.size()),

@@ -196,6 +196,107 @@ Example format:
 }
 ```
 
+## IPC and GameClientMock
+
+The solution now also includes:
+
+- `GameClientMock`
+  A console project that simulates the future game client and talks to `Client.exe` through local IPC
+
+IPC is currently implemented as:
+
+- JSON-over-TCP on `127.0.0.1:17832`
+- `Client.exe` acts as the local IPC server
+- `GameClientMock.exe` acts as the local IPC client
+
+### Client startup behavior
+
+`Client.exe` now supports two startup modes:
+
+- No arguments:
+  Starts in IPC mode only and waits for commands from `GameClientMock` or the future game client
+- Full startup arguments:
+  Automatically joins a voice channel using the provided CLI values
+
+Valid auto-join example:
+
+```powershell
+Client.exe --server 127.0.0.1:7000 --token test --channel guild_123 --player playerA
+```
+
+If only part of the required startup arguments is provided, the client prints a warning plus a correct usage example and exits.
+
+### GameClientMock usage
+
+Recommended test flow:
+
+1. Start `Client.exe` with no arguments
+2. Start `GameClientMock.exe`
+3. Type commands into the `GameClientMock.exe` console and press Enter
+
+At startup, `GameClientMock.exe` connects to the local IPC port and requests current state automatically.
+
+Useful commands:
+
+```txt
+help
+status
+hello
+login <playerId> <token> [server host:port] [channelId]
+join [channelId]
+leave
+mute on
+mute off
+toggle-mute
+quit-client
+quit
+```
+
+Typical manual IPC test:
+
+```txt
+status
+login playerA test 127.0.0.1:7000 guild_123
+join
+status
+mute on
+mute off
+leave
+```
+
+Important notes:
+
+- `quit`
+  Closes `GameClientMock.exe` only
+- `quit-client`
+  Sends an IPC command that asks `Client.exe` to terminate
+
+### Current IPC command/event direction
+
+Game-side commands currently supported:
+
+- `HELLO`
+- `STATUS`
+- `LOGIN`
+- `JOIN`
+- `LEAVE`
+- `MUTE`
+- `TOGGLE_MUTE`
+- `QUIT`
+
+VoIP-side events currently emitted:
+
+- `READY`
+- `STATE`
+- `PEER_JOIN`
+- `PEER_LEAVE`
+- `SPEAKING`
+- `ERROR`
+- `LOGIN_APPLIED`
+- `JOINED`
+- `LEFT`
+- `MUTE_CHANGED`
+
 ## Recommended Deployment Notes
 
 - Open `TCP 7000` and `UDP 40000` on the VoIP server

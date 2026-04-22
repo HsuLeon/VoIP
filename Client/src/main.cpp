@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -63,6 +64,150 @@ Args parseArgs(int argc, char* argv[]) {
     return args;
 }
 
+std::string readTextFile(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    return std::string((std::istreambuf_iterator<char>(in)),
+                       std::istreambuf_iterator<char>());
+}
+
+bool fileExists(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return static_cast<bool>(in);
+}
+
+void writeDefaultClientConfigFile(const std::string& path,
+                                  const VoIP::ChannelConfig& cfg) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return;
+
+    out << "{\n";
+    out << "  \"signalingServer\": \"" << cfg.signalingServer << "\",\n";
+    out << "  \"signalingPort\": " << cfg.signalingPort << ",\n";
+    out << "  \"token\": \"" << cfg.token << "\",\n";
+    out << "  \"channelId\": \"" << cfg.channelId << "\",\n";
+    out << "  \"playerId\": \"" << cfg.playerId << "\",\n";
+    out << "\n";
+    out << "  \"opusBitrate\": " << cfg.opusBitrate << ",\n";
+    out << "  \"captureVadDb\": " << cfg.captureVadDb << ",\n";
+    out << "  \"captureHangoverFrames\": " << cfg.captureHangoverFrames << ",\n";
+    out << "\n";
+    out << "  \"enableEchoCancel\": "
+        << (cfg.enableEchoCancel ? "true" : "false") << ",\n";
+    out << "  \"aecFilterMs\": " << cfg.aecFilterMs << ",\n";
+    out << "  \"aecEchoSuppress\": " << cfg.aecEchoSuppress << ",\n";
+    out << "  \"aecEchoSuppressActive\": " << cfg.aecEchoSuppressActive << ",\n";
+    out << "\n";
+    out << "  \"enableDenoise\": "
+        << (cfg.enableDenoise ? "true" : "false") << "\n";
+    out << "}\n";
+}
+
+std::string jStr(const std::string& j, const std::string& key) {
+    std::string pat = "\"" + key + "\"";
+    auto k = j.find(pat);
+    if (k == std::string::npos) return {};
+    auto c = j.find(':', k + pat.size());
+    if (c == std::string::npos) return {};
+    auto q1 = j.find('"', c + 1);
+    if (q1 == std::string::npos) return {};
+    auto q2 = j.find('"', q1 + 1);
+    if (q2 == std::string::npos) return {};
+    return j.substr(q1 + 1, q2 - q1 - 1);
+}
+
+bool jBool(const std::string& j, const std::string& key, bool& out) {
+    std::string pat = "\"" + key + "\"";
+    auto k = j.find(pat);
+    if (k == std::string::npos) return false;
+    auto c = j.find(':', k + pat.size());
+    if (c == std::string::npos) return false;
+    size_t v = c + 1;
+    while (v < j.size() &&
+           (j[v] == ' ' || j[v] == '\t' || j[v] == '\r' || j[v] == '\n'))
+        ++v;
+    if (j.compare(v, 4, "true") == 0) {
+        out = true;
+        return true;
+    }
+    if (j.compare(v, 5, "false") == 0) {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
+bool jInt(const std::string& j, const std::string& key, int& out) {
+    std::string pat = "\"" + key + "\"";
+    auto k = j.find(pat);
+    if (k == std::string::npos) return false;
+    auto c = j.find(':', k + pat.size());
+    if (c == std::string::npos) return false;
+    size_t v = c + 1;
+    while (v < j.size() &&
+           (j[v] == ' ' || j[v] == '\t' || j[v] == '\r' || j[v] == '\n'))
+        ++v;
+    char* end = nullptr;
+    long val = std::strtol(j.c_str() + v, &end, 10);
+    if (end == j.c_str() + v) return false;
+    out = static_cast<int>(val);
+    return true;
+}
+
+bool jFloat(const std::string& j, const std::string& key, float& out) {
+    std::string pat = "\"" + key + "\"";
+    auto k = j.find(pat);
+    if (k == std::string::npos) return false;
+    auto c = j.find(':', k + pat.size());
+    if (c == std::string::npos) return false;
+    size_t v = c + 1;
+    while (v < j.size() &&
+           (j[v] == ' ' || j[v] == '\t' || j[v] == '\r' || j[v] == '\n'))
+        ++v;
+    char* end = nullptr;
+    float val = std::strtof(j.c_str() + v, &end);
+    if (end == j.c_str() + v) return false;
+    out = val;
+    return true;
+}
+
+void applyClientConfigFile(VoIP::ChannelConfig& cfg, const std::string& path) {
+    if (!fileExists(path)) {
+        writeDefaultClientConfigFile(path, cfg);
+        return;
+    }
+
+    const std::string text = readTextFile(path);
+    if (text.empty()) return;
+
+    if (auto v = jStr(text, "signalingServer"); !v.empty()) cfg.signalingServer = v;
+    if (int v; jInt(text, "signalingPort", v) && v > 0 && v <= 65535)
+        cfg.signalingPort = static_cast<uint16_t>(v);
+    if (auto v = jStr(text, "turnServer"); !v.empty()) cfg.turnServer = v;
+    if (int v; jInt(text, "turnPort", v) && v > 0 && v <= 65535)
+        cfg.turnPort = static_cast<uint16_t>(v);
+    if (auto v = jStr(text, "token"); !v.empty()) cfg.token = v;
+    if (auto v = jStr(text, "channelId"); !v.empty()) cfg.channelId = v;
+    if (auto v = jStr(text, "playerId"); !v.empty()) cfg.playerId = v;
+
+    if (int v; jInt(text, "opusBitrate", v) && v > 0)
+        cfg.opusBitrate = v;
+    if (float v; jFloat(text, "captureVadDb", v))
+        cfg.captureVadDb = v;
+    if (int v; jInt(text, "captureHangoverFrames", v) && v >= 0)
+        cfg.captureHangoverFrames = v;
+    if (int v; jInt(text, "aecFilterMs", v) && v > 0)
+        cfg.aecFilterMs = v;
+    if (int v; jInt(text, "aecEchoSuppress", v))
+        cfg.aecEchoSuppress = v;
+    if (int v; jInt(text, "aecEchoSuppressActive", v))
+        cfg.aecEchoSuppressActive = v;
+    if (bool v; jBool(text, "enableEchoCancel", v))
+        cfg.enableEchoCancel = v;
+    if (bool v; jBool(text, "enableDenoise", v))
+        cfg.enableDenoise = v;
+}
+
 // ═══════════════════════════════════════════════════════════
 //  主程式
 // ═══════════════════════════════════════════════════════════
@@ -90,6 +235,7 @@ int main(int argc, char* argv[]) {
     cfg.channelId       = args.channelId;
     cfg.playerId        = args.playerId;
     cfg.token           = args.token;
+    applyClientConfigFile(cfg, "client_config.json");
 
     VoIP::ChannelEvents ev;
 

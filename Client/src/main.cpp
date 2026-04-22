@@ -1,15 +1,3 @@
-// Client/src/main.cpp
-// VoIP Client – 端對端測試版（TEST BUILD）
-//
-// 本版本跳過 IPC，直接從命令列參數自動 join 頻道，
-// 適合兩個 cmd 視窗對打，驗證 Signaling + UDP 打洞 + 音訊管線。
-//
-// 啟動範例（開兩個 cmd）：
-//   VoIPClient.exe --server 127.0.0.1:7000 --token test --channel guild_123 --player playerA
-//   VoIPClient.exe --server 127.0.0.1:7000 --token test --channel guild_123 --player playerB
-//
-// 按 Enter 離開；按 m + Enter 切換靜音
-
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -18,12 +6,18 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
-// ── Ctrl+C 處理 ───────────────────────────────────────
+namespace {
+
 std::atomic<bool> g_running{true};
 
 BOOL WINAPI consoleCtrlHandler(DWORD) {
@@ -31,35 +25,57 @@ BOOL WINAPI consoleCtrlHandler(DWORD) {
     return TRUE;
 }
 
-// ── 啟動參數解析 ──────────────────────────────────────
 struct Args {
     std::string serverHost = "127.0.0.1";
-    uint16_t    serverPort = 7000;
-    std::string token      = "test";
-    std::string channelId  = "guild_123";
-    std::string playerId   = "player_A";
+    uint16_t serverPort = 7000;
+    std::string token = "test";
+    std::string channelId = "guild_123";
+    std::string playerId = "player_A";
+    bool ipcOnly = false;
 };
 
 Args parseArgs(int argc, char* argv[]) {
     Args args;
-    for (int i = 1; i + 1 < argc; ++i) {
-        std::string key = argv[i];
-        std::string val = argv[i + 1];
+    for (int i = 1; i < argc; ++i) {
+        const std::string key = argv[i];
 
+        if (key == "--ipc-only") {
+            args.ipcOnly = true;
+            continue;
+        }
+
+        if (i + 1 >= argc) {
+            continue;
+        }
+
+        const std::string val = argv[i + 1];
         if (key == "--server") {
-            // 格式：host:port  或  host（預設 7000）
-            auto colon = val.find(':');
+            const auto colon = val.find(':');
             if (colon != std::string::npos) {
                 args.serverHost = val.substr(0, colon);
-                args.serverPort = static_cast<uint16_t>(
-                    std::stoi(val.substr(colon + 1)));
+                args.serverPort =
+                    static_cast<uint16_t>(std::stoi(val.substr(colon + 1)));
             } else {
                 args.serverHost = val;
             }
+            ++i;
+            continue;
         }
-        if (key == "--token")   args.token     = val;
-        if (key == "--channel") args.channelId = val;
-        if (key == "--player")  args.playerId  = val;
+        if (key == "--token") {
+            args.token = val;
+            ++i;
+            continue;
+        }
+        if (key == "--channel") {
+            args.channelId = val;
+            ++i;
+            continue;
+        }
+        if (key == "--player") {
+            args.playerId = val;
+            ++i;
+            continue;
+        }
     }
     return args;
 }
@@ -104,28 +120,29 @@ void writeDefaultClientConfigFile(const std::string& path,
 }
 
 std::string jStr(const std::string& j, const std::string& key) {
-    std::string pat = "\"" + key + "\"";
-    auto k = j.find(pat);
+    const std::string pat = "\"" + key + "\"";
+    const auto k = j.find(pat);
     if (k == std::string::npos) return {};
-    auto c = j.find(':', k + pat.size());
+    const auto c = j.find(':', k + pat.size());
     if (c == std::string::npos) return {};
-    auto q1 = j.find('"', c + 1);
+    const auto q1 = j.find('"', c + 1);
     if (q1 == std::string::npos) return {};
-    auto q2 = j.find('"', q1 + 1);
+    const auto q2 = j.find('"', q1 + 1);
     if (q2 == std::string::npos) return {};
     return j.substr(q1 + 1, q2 - q1 - 1);
 }
 
 bool jBool(const std::string& j, const std::string& key, bool& out) {
-    std::string pat = "\"" + key + "\"";
-    auto k = j.find(pat);
+    const std::string pat = "\"" + key + "\"";
+    const auto k = j.find(pat);
     if (k == std::string::npos) return false;
-    auto c = j.find(':', k + pat.size());
+    const auto c = j.find(':', k + pat.size());
     if (c == std::string::npos) return false;
     size_t v = c + 1;
     while (v < j.size() &&
-           (j[v] == ' ' || j[v] == '\t' || j[v] == '\r' || j[v] == '\n'))
+           (j[v] == ' ' || j[v] == '\t' || j[v] == '\r' || j[v] == '\n')) {
         ++v;
+    }
     if (j.compare(v, 4, "true") == 0) {
         out = true;
         return true;
@@ -138,34 +155,36 @@ bool jBool(const std::string& j, const std::string& key, bool& out) {
 }
 
 bool jInt(const std::string& j, const std::string& key, int& out) {
-    std::string pat = "\"" + key + "\"";
-    auto k = j.find(pat);
+    const std::string pat = "\"" + key + "\"";
+    const auto k = j.find(pat);
     if (k == std::string::npos) return false;
-    auto c = j.find(':', k + pat.size());
+    const auto c = j.find(':', k + pat.size());
     if (c == std::string::npos) return false;
     size_t v = c + 1;
     while (v < j.size() &&
-           (j[v] == ' ' || j[v] == '\t' || j[v] == '\r' || j[v] == '\n'))
+           (j[v] == ' ' || j[v] == '\t' || j[v] == '\r' || j[v] == '\n')) {
         ++v;
+    }
     char* end = nullptr;
-    long val = std::strtol(j.c_str() + v, &end, 10);
+    const long val = std::strtol(j.c_str() + v, &end, 10);
     if (end == j.c_str() + v) return false;
     out = static_cast<int>(val);
     return true;
 }
 
 bool jFloat(const std::string& j, const std::string& key, float& out) {
-    std::string pat = "\"" + key + "\"";
-    auto k = j.find(pat);
+    const std::string pat = "\"" + key + "\"";
+    const auto k = j.find(pat);
     if (k == std::string::npos) return false;
-    auto c = j.find(':', k + pat.size());
+    const auto c = j.find(':', k + pat.size());
     if (c == std::string::npos) return false;
     size_t v = c + 1;
     while (v < j.size() &&
-           (j[v] == ' ' || j[v] == '\t' || j[v] == '\r' || j[v] == '\n'))
+           (j[v] == ' ' || j[v] == '\t' || j[v] == '\r' || j[v] == '\n')) {
         ++v;
+    }
     char* end = nullptr;
-    float val = std::strtof(j.c_str() + v, &end);
+    const float val = std::strtof(j.c_str() + v, &end);
     if (end == j.c_str() + v) return false;
     out = val;
     return true;
@@ -180,128 +199,448 @@ void applyClientConfigFile(VoIP::ChannelConfig& cfg, const std::string& path) {
     const std::string text = readTextFile(path);
     if (text.empty()) return;
 
-    if (auto v = jStr(text, "signalingServer"); !v.empty()) cfg.signalingServer = v;
-    if (int v; jInt(text, "signalingPort", v) && v > 0 && v <= 65535)
+    if (const auto v = jStr(text, "signalingServer"); !v.empty()) {
+        cfg.signalingServer = v;
+    }
+    if (int v; jInt(text, "signalingPort", v) && v > 0 && v <= 65535) {
         cfg.signalingPort = static_cast<uint16_t>(v);
-    if (auto v = jStr(text, "turnServer"); !v.empty()) cfg.turnServer = v;
-    if (int v; jInt(text, "turnPort", v) && v > 0 && v <= 65535)
+    }
+    if (const auto v = jStr(text, "turnServer"); !v.empty()) {
+        cfg.turnServer = v;
+    }
+    if (int v; jInt(text, "turnPort", v) && v > 0 && v <= 65535) {
         cfg.turnPort = static_cast<uint16_t>(v);
-    if (auto v = jStr(text, "token"); !v.empty()) cfg.token = v;
-    if (auto v = jStr(text, "channelId"); !v.empty()) cfg.channelId = v;
-    if (auto v = jStr(text, "playerId"); !v.empty()) cfg.playerId = v;
+    }
+    if (const auto v = jStr(text, "token"); !v.empty()) {
+        cfg.token = v;
+    }
+    if (const auto v = jStr(text, "channelId"); !v.empty()) {
+        cfg.channelId = v;
+    }
+    if (const auto v = jStr(text, "playerId"); !v.empty()) {
+        cfg.playerId = v;
+    }
 
-    if (int v; jInt(text, "opusBitrate", v) && v > 0)
+    if (int v; jInt(text, "opusBitrate", v) && v > 0) {
         cfg.opusBitrate = v;
-    if (float v; jFloat(text, "captureVadDb", v))
+    }
+    if (float v; jFloat(text, "captureVadDb", v)) {
         cfg.captureVadDb = v;
-    if (int v; jInt(text, "captureHangoverFrames", v) && v >= 0)
+    }
+    if (int v; jInt(text, "captureHangoverFrames", v) && v >= 0) {
         cfg.captureHangoverFrames = v;
-    if (int v; jInt(text, "aecFilterMs", v) && v > 0)
+    }
+    if (int v; jInt(text, "aecFilterMs", v) && v > 0) {
         cfg.aecFilterMs = v;
-    if (int v; jInt(text, "aecEchoSuppress", v))
+    }
+    if (int v; jInt(text, "aecEchoSuppress", v)) {
         cfg.aecEchoSuppress = v;
-    if (int v; jInt(text, "aecEchoSuppressActive", v))
+    }
+    if (int v; jInt(text, "aecEchoSuppressActive", v)) {
         cfg.aecEchoSuppressActive = v;
-    if (bool v; jBool(text, "enableEchoCancel", v))
+    }
+    if (bool v; jBool(text, "enableEchoCancel", v)) {
         cfg.enableEchoCancel = v;
-    if (bool v; jBool(text, "enableDenoise", v))
+    }
+    if (bool v; jBool(text, "enableDenoise", v)) {
         cfg.enableDenoise = v;
+    }
 }
 
-// ═══════════════════════════════════════════════════════════
-//  主程式
-// ═══════════════════════════════════════════════════════════
+std::string jsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char ch : s) {
+        switch (ch) {
+        case '\\': out += "\\\\"; break;
+        case '"': out += "\\\""; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default: out.push_back(ch); break;
+        }
+    }
+    return out;
+}
+
+void appendJsonStringField(std::string& json,
+                           bool& first,
+                           const std::string& key,
+                           const std::string& value) {
+    if (!first) json += ",";
+    first = false;
+    json += "\"" + key + "\":\"" + jsonEscape(value) + "\"";
+}
+
+void appendJsonBoolField(std::string& json,
+                         bool& first,
+                         const std::string& key,
+                         bool value) {
+    if (!first) json += ",";
+    first = false;
+    json += "\"" + key + "\":" + std::string(value ? "true" : "false");
+}
+
+void appendJsonIntField(std::string& json,
+                        bool& first,
+                        const std::string& key,
+                        int value) {
+    if (!first) json += ",";
+    first = false;
+    json += "\"" + key + "\":" + std::to_string(value);
+}
+
+bool parseHostPort(const std::string& input,
+                   std::string& host,
+                   uint16_t& port) {
+    const auto colon = input.find(':');
+    if (colon == std::string::npos) {
+        host = input;
+        return !host.empty();
+    }
+
+    host = input.substr(0, colon);
+    int parsedPort = 0;
+    try {
+        parsedPort = std::stoi(input.substr(colon + 1));
+    } catch (...) {
+        return false;
+    }
+    if (parsedPort <= 0 || parsedPort > 65535) {
+        return false;
+    }
+    port = static_cast<uint16_t>(parsedPort);
+    return !host.empty();
+}
+
+std::string buildStateJson(const VoIP::ChannelConfig& cfg,
+                           bool joined,
+                           bool muted,
+                           bool ipcOnly) {
+    std::string json = "{";
+    bool first = true;
+    appendJsonIntField(json, first, "ver", VoIP::IPC_VERSION);
+    appendJsonStringField(json, first, "evt", "STATE");
+    appendJsonStringField(json, first, "playerId", cfg.playerId);
+    appendJsonStringField(json, first, "channelId", cfg.channelId);
+    appendJsonStringField(json, first, "signalingServer", cfg.signalingServer);
+    appendJsonIntField(json, first, "signalingPort", cfg.signalingPort);
+    appendJsonBoolField(json, first, "joined", joined);
+    appendJsonBoolField(json, first, "muted", muted);
+    appendJsonBoolField(json, first, "ipcOnly", ipcOnly);
+    json += "}";
+    return json;
+}
+
+std::string buildSimpleEventJson(const std::string& evt) {
+    std::string json = "{";
+    bool first = true;
+    appendJsonIntField(json, first, "ver", VoIP::IPC_VERSION);
+    appendJsonStringField(json, first, "evt", evt);
+    json += "}";
+    return json;
+}
+
+} // namespace
+
 int main(int argc, char* argv[]) {
     SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
 
-    Args args = parseArgs(argc, argv);
+    const Args args = parseArgs(argc, argv);
 
     std::cout << "========================================\n";
     std::cout << "  VoIP Client  [TEST BUILD]\n";
     std::cout << "  Server  : " << args.serverHost << ":" << args.serverPort << "\n";
-    std::cout << "  Channel : " << args.channelId  << "\n";
-    std::cout << "  Player  : " << args.playerId   << "\n";
+    std::cout << "  Channel : " << args.channelId << "\n";
+    std::cout << "  Player  : " << args.playerId << "\n";
     std::cout << "========================================\n";
     std::cout << "  q+Enter = quit\n";
     std::cout << "  m+Enter = toggle mute\n";
+    std::cout << "  --ipc-only = wait for GameClientMock IPC commands\n";
     std::cout << "========================================\n\n";
 
-    // ── 建立 Channel 並設定事件回呼 ──────────────────────
     VoIP::Channel channel;
-
     VoIP::ChannelConfig cfg;
     cfg.signalingServer = args.serverHost;
-    cfg.signalingPort   = args.serverPort;
-    cfg.channelId       = args.channelId;
-    cfg.playerId        = args.playerId;
-    cfg.token           = args.token;
+    cfg.signalingPort = args.serverPort;
+    cfg.channelId = args.channelId;
+    cfg.playerId = args.playerId;
+    cfg.token = args.token;
     applyClientConfigFile(cfg, "client_config.json");
 
+    std::mutex channelMtx;
+    std::mutex cfgMtx;
+    std::atomic<bool> joined{false};
+
+    VoIP::IpcServer ipc;
+    const auto sendIpc = [&](const std::string& json) {
+        ipc.send(json);
+    };
+
+    const auto sendState = [&]() {
+        std::scoped_lock lock(channelMtx, cfgMtx);
+        sendIpc(buildStateJson(cfg, joined.load(), channel.isMuted(), args.ipcOnly));
+    };
+
     VoIP::ChannelEvents ev;
-
-    ev.onPeerJoined = [](const std::string& id) {
+    ev.onPeerJoined = [&](const std::string& id) {
         std::cout << "[+] Peer joined  : " << id << "\n";
+        std::string json = "{";
+        bool first = true;
+        appendJsonIntField(json, first, "ver", VoIP::IPC_VERSION);
+        appendJsonStringField(json, first, "evt", "PEER_JOIN");
+        appendJsonStringField(json, first, "playerId", id);
+        json += "}";
+        sendIpc(json);
     };
 
-    ev.onPeerLeft = [](const std::string& id) {
+    ev.onPeerLeft = [&](const std::string& id) {
         std::cout << "[-] Peer left    : " << id << "\n";
+        std::string json = "{";
+        bool first = true;
+        appendJsonIntField(json, first, "ver", VoIP::IPC_VERSION);
+        appendJsonStringField(json, first, "evt", "PEER_LEAVE");
+        appendJsonStringField(json, first, "playerId", id);
+        json += "}";
+        sendIpc(json);
     };
 
+    ev.onSpeakingChanged = [&](const std::string& id, bool speaking) {
 #ifdef _DEBUG
-    ev.onSpeakingChanged = [](const std::string& id, bool speaking) {
         std::cout << "[~] " << id
-                  << (speaking ? " >> SPEAKING" : "    silent")
-                  << "\n";
-    };
+                  << (speaking ? " >> SPEAKING" : "    silent") << "\n";
 #endif
-
-    ev.onError = [](const std::string& msg) {
-        std::cerr << "[ERR] " << msg << "\n";
+        std::string json = "{";
+        bool first = true;
+        appendJsonIntField(json, first, "ver", VoIP::IPC_VERSION);
+        appendJsonStringField(json, first, "evt", "SPEAKING");
+        appendJsonStringField(json, first, "playerId", id);
+        appendJsonBoolField(json, first, "speaking", speaking);
+        json += "}";
+        sendIpc(json);
     };
 
-    // ── 加入頻道 ──────────────────────────────────────────
-    std::cout << "[*] Joining channel...\n";
-    if (!channel.join(cfg, ev)) {
-        std::cerr << "[!] join() failed. Check server is running.\n";
-        return 1;
-    }
-    std::cout << "[*] Joined! Microphone active.\n\n";
+    ev.onError = [&](const std::string& msg) {
+        std::cerr << "[ERR] " << msg << "\n";
+        std::string json = "{";
+        bool first = true;
+        appendJsonIntField(json, first, "ver", VoIP::IPC_VERSION);
+        appendJsonStringField(json, first, "evt", "ERROR");
+        appendJsonStringField(json, first, "message", msg);
+        json += "}";
+        sendIpc(json);
+    };
 
-    // ── 鍵盤輸入執行緒（Enter/m）────────────────────────
+    const auto joinCurrentConfig = [&](const std::string& reason) -> bool {
+        std::scoped_lock lock(channelMtx, cfgMtx);
+
+        if (joined.load()) {
+            channel.leave();
+            joined = false;
+        }
+
+        std::cout << "[*] Joining channel";
+        if (!reason.empty()) {
+            std::cout << " (" << reason << ")";
+        }
+        std::cout << "...\n";
+
+        if (!channel.join(cfg, ev)) {
+            std::cerr << "[!] join() failed. Check server is running.\n";
+            return false;
+        }
+
+        joined = true;
+        std::cout << "[*] Joined! Microphone active.\n";
+        return true;
+    };
+
+    if (!ipc.start([&](const std::string& jsonMsg) {
+            const std::string cmd = jStr(jsonMsg, "cmd");
+            if (cmd.empty()) return;
+
+            if (cmd == "HELLO") {
+                sendIpc(buildSimpleEventJson("READY"));
+                sendState();
+                return;
+            }
+
+            if (cmd == "STATUS") {
+                sendState();
+                return;
+            }
+
+            if (cmd == "LOGIN") {
+                {
+                    std::lock_guard<std::mutex> cfgLock(cfgMtx);
+
+                    if (const auto v = jStr(jsonMsg, "server"); !v.empty()) {
+                        std::string host = cfg.signalingServer;
+                        uint16_t port = cfg.signalingPort;
+                        if (parseHostPort(v, host, port)) {
+                            cfg.signalingServer = host;
+                            cfg.signalingPort = port;
+                        }
+                    }
+                    if (const auto v = jStr(jsonMsg, "signalingServer"); !v.empty()) {
+                        cfg.signalingServer = v;
+                    }
+                    if (int v; jInt(jsonMsg, "signalingPort", v) &&
+                               v > 0 && v <= 65535) {
+                        cfg.signalingPort = static_cast<uint16_t>(v);
+                    }
+                    if (const auto v = jStr(jsonMsg, "token"); !v.empty()) {
+                        cfg.token = v;
+                    }
+                    if (const auto v = jStr(jsonMsg, "playerId"); !v.empty()) {
+                        cfg.playerId = v;
+                    }
+                    if (const auto v = jStr(jsonMsg, "channelId"); !v.empty()) {
+                        cfg.channelId = v;
+                    }
+                }
+
+                sendIpc(buildSimpleEventJson("LOGIN_APPLIED"));
+                sendState();
+                return;
+            }
+
+            if (cmd == "JOIN") {
+                {
+                    std::lock_guard<std::mutex> cfgLock(cfgMtx);
+                    if (const auto v = jStr(jsonMsg, "channelId"); !v.empty()) {
+                        cfg.channelId = v;
+                    }
+                    if (const auto v = jStr(jsonMsg, "playerId"); !v.empty()) {
+                        cfg.playerId = v;
+                    }
+                    if (const auto v = jStr(jsonMsg, "token"); !v.empty()) {
+                        cfg.token = v;
+                    }
+                    if (const auto v = jStr(jsonMsg, "server"); !v.empty()) {
+                        std::string host = cfg.signalingServer;
+                        uint16_t port = cfg.signalingPort;
+                        if (parseHostPort(v, host, port)) {
+                            cfg.signalingServer = host;
+                            cfg.signalingPort = port;
+                        }
+                    }
+                }
+
+                if (joinCurrentConfig("IPC")) {
+                    sendIpc(buildSimpleEventJson("JOINED"));
+                }
+                sendState();
+                return;
+            }
+
+            if (cmd == "LEAVE") {
+                {
+                    std::lock_guard<std::mutex> channelLock(channelMtx);
+                    if (joined.load()) {
+                        channel.leave();
+                        joined = false;
+                        std::cout << "[*] Left channel from IPC.\n";
+                    }
+                }
+                sendIpc(buildSimpleEventJson("LEFT"));
+                sendState();
+                return;
+            }
+
+            if (cmd == "MUTE") {
+                bool muted = false;
+                if (!jBool(jsonMsg, "muted", muted)) {
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> channelLock(channelMtx);
+                    channel.setMuted(muted);
+                }
+                std::cout << (muted ? "[MIC] Muted\n" : "[MIC] Unmuted\n");
+                sendIpc(buildSimpleEventJson("MUTE_CHANGED"));
+                sendState();
+                return;
+            }
+
+            if (cmd == "TOGGLE_MUTE") {
+                bool muted = false;
+                {
+                    std::lock_guard<std::mutex> channelLock(channelMtx);
+                    muted = !channel.isMuted();
+                    channel.setMuted(muted);
+                }
+                std::cout << (muted ? "[MIC] Muted\n" : "[MIC] Unmuted\n");
+                sendIpc(buildSimpleEventJson("MUTE_CHANGED"));
+                sendState();
+                return;
+            }
+
+            if (cmd == "QUIT") {
+                g_running = false;
+                return;
+            }
+        })) {
+        std::cerr << "[ERR] Failed to start IPC server on 127.0.0.1:"
+                  << VoIP::IPC_PORT << "\n";
+    } else {
+        std::cout << "[*] IPC server listening on 127.0.0.1:" << VoIP::IPC_PORT
+                  << "\n";
+    }
+
+    if (!args.ipcOnly) {
+        if (!joinCurrentConfig("startup")) {
+            return 1;
+        }
+    } else {
+        std::cout << "[*] IPC-only mode. Waiting for GameClientMock commands.\n";
+    }
+
     std::thread inputThread([&]() {
         std::string line;
         while (g_running && std::getline(std::cin, line)) {
             if (line == "m" || line == "M") {
-                bool muted = !channel.isMuted();
-                channel.setMuted(muted);
+                bool muted = false;
+                {
+                    std::lock_guard<std::mutex> channelLock(channelMtx);
+                    muted = !channel.isMuted();
+                    channel.setMuted(muted);
+                }
                 std::cout << (muted ? "[MIC] Muted\n" : "[MIC] Unmuted\n");
+                sendIpc(buildSimpleEventJson("MUTE_CHANGED"));
+                sendState();
             } else if (line == "q" || line == "Q" || line == "quit") {
-                // 明確輸入 q 才退出
                 g_running = false;
                 break;
             }
-            // 空行或其他指令直接忽略，不退出
         }
-        // getline 回傳 false（EOF / stdin 關閉）時也退出
         g_running = false;
     });
 
-    // ── 主迴圈：每 20ms tick 一次 ────────────────────────
-    // tick() 負責：打洞計時、jitter 解碼、VAD、混音、播放
     auto nextTick = std::chrono::steady_clock::now();
     while (g_running) {
-        channel.tick();
+        {
+            std::lock_guard<std::mutex> channelLock(channelMtx);
+            channel.tick();
+        }
         nextTick += std::chrono::milliseconds(20);
         std::this_thread::sleep_until(nextTick);
     }
 
-    // ── 離開頻道 ──────────────────────────────────────────
     std::cout << "\n[*] Leaving channel...\n";
-    channel.leave();
+    {
+        std::lock_guard<std::mutex> channelLock(channelMtx);
+        if (joined.load()) {
+            channel.leave();
+            joined = false;
+        }
+    }
+    ipc.stop();
     std::cout << "[*] Done.\n";
 
-    if (inputThread.joinable())
+    if (inputThread.joinable()) {
         inputThread.join();
+    }
 
     return 0;
 }

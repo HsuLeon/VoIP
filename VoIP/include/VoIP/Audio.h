@@ -11,6 +11,7 @@ constexpr int FRAME_MS      = 20;
 constexpr int FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000;
 
 using CaptureCallback = std::function<void(const int16_t* pcm, int sampleCount)>;
+using PlaybackCallback = std::function<void(const int16_t* pcm, int sampleCount)>;
 
 class AudioDevice {
 public:
@@ -22,6 +23,7 @@ public:
 
     bool startCapture(CaptureCallback cb);
     void stopCapture();
+    void setPlaybackTap(PlaybackCallback cb);
 
     void play(const int16_t* pcm, int sampleCount);
 

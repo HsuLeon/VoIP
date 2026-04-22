@@ -229,6 +229,8 @@ struct Channel::Impl {
     SpeexPreprocessState* echoPreprocess = nullptr;
     DenoiseState* denoiseState = nullptr;
     std::vector<int16_t> echoBuf;
+    std::vector<int16_t> playbackRefBuf;
+    int           echoPlaybackFramesQueued = 0;
     std::vector<float> denoiseInBuf;
     std::vector<float> denoiseOutBuf;
     uint64_t      lastCaptureGeneration = 0;
@@ -358,6 +360,8 @@ struct Channel::Impl {
             echoState = nullptr;
         }
         echoBuf.clear();
+        playbackRefBuf.clear();
+        echoPlaybackFramesQueued = 0;
     }
 
     void resetEchoCancel() {
@@ -368,17 +372,26 @@ struct Channel::Impl {
     }
 
     void registerPlaybackReference(const int16_t* pcm, int samples) {
-        if (!echoState || !pcm || samples != FRAME_SAMPLES) return;
+        if (!echoState || !pcm || samples <= 0) return;
         std::lock_guard<std::mutex> lk(echoMtx);
         if (!echoState) return;
-        speex_echo_playback(echoState, pcm);
+        playbackRefBuf.insert(playbackRefBuf.end(), pcm, pcm + samples);
+        while (static_cast<int>(playbackRefBuf.size()) >= FRAME_SAMPLES) {
+            speex_echo_playback(echoState, playbackRefBuf.data());
+            playbackRefBuf.erase(playbackRefBuf.begin(),
+                                 playbackRefBuf.begin() + FRAME_SAMPLES);
+            if (echoPlaybackFramesQueued < 8)
+                ++echoPlaybackFramesQueued;
+        }
     }
 
     void applyEchoCancel(int16_t* pcm, int samples) {
         if (!echoState || !pcm || samples != FRAME_SAMPLES) return;
         std::lock_guard<std::mutex> lk(echoMtx);
         if (!echoState || echoBuf.size() != FRAME_SAMPLES) return;
+        if (echoPlaybackFramesQueued <= 0) return;
         speex_echo_capture(echoState, pcm, echoBuf.data());
+        --echoPlaybackFramesQueued;
         if (echoPreprocess)
             speex_preprocess_run(echoPreprocess, echoBuf.data());
         std::copy(echoBuf.begin(), echoBuf.end(), pcm);
@@ -847,6 +860,10 @@ bool Channel::join(const ChannelConfig& cfg, const ChannelEvents& events) {
 
     // ── Step 9: 啟動收音（miniaudio 非同步執行緒）
     m_impl->lastPlaybackGeneration = m_impl->audio.playbackGeneration();
+    m_impl->audio.setPlaybackTap(
+        [impl = m_impl](const int16_t* pcm, int n) {
+            impl->registerPlaybackReference(pcm, n);
+        });
     m_impl->audio.startCapture(
         [impl = m_impl](const int16_t* pcm, int n) {
             impl->handleCapture(pcm, n);
@@ -863,6 +880,7 @@ void Channel::leave() {
 
     // 停止收音
     m_impl->audio.stopCapture();
+    m_impl->audio.setPlaybackTap({});
 
     // 送 LEAVE 並關閉 TCP
     if (m_impl->sigSock != INVALID_SOCKET) {
@@ -1066,7 +1084,6 @@ void Channel::tick() {
 
     // ② 混音並送入播放佇列
     m_impl->mixer.mix(m_impl->mixBuf.data());
-    m_impl->registerPlaybackReference(m_impl->mixBuf.data(), FRAME_SAMPLES);
     m_impl->audio.play(m_impl->mixBuf.data(), FRAME_SAMPLES);
 }
 

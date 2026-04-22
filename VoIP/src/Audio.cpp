@@ -24,6 +24,7 @@ struct AudioDevice::Impl {
     ma_device        playbackDevice{};
     ma_device_config playbackConfig{};
     bool             playbackInitialized = false;
+    PlaybackCallback playbackTap;
 
     std::deque<int16_t> playQueue;
     std::mutex          playMtx;
@@ -64,25 +65,34 @@ struct AudioDevice::Impl {
             return;
         }
 
-        std::lock_guard<std::mutex> lock(impl->playMtx);
+        PlaybackCallback playbackTap;
+        {
+            std::lock_guard<std::mutex> lock(impl->playMtx);
         constexpr size_t MIN_PRIME =
             static_cast<size_t>(FRAME_SAMPLES) * CHANNELS * 2;
 
-        if (!impl->playbackPrimed) {
-            if (impl->playQueue.size() < MIN_PRIME) {
-                std::fill(out, out + needed, int16_t{0});
-                return;
+            if (!impl->playbackPrimed) {
+                if (impl->playQueue.size() < MIN_PRIME) {
+                    std::fill(out, out + needed, int16_t{0});
+                    return;
+                }
+                impl->playbackPrimed = true;
             }
-            impl->playbackPrimed = true;
+
+            for (size_t i = 0; i < needed; ++i) {
+                if (!impl->playQueue.empty()) {
+                    out[i] = impl->playQueue.front();
+                    impl->playQueue.pop_front();
+                } else {
+                    out[i] = 0;
+                }
+            }
+
+            playbackTap = impl->playbackTap;
         }
 
-        for (size_t i = 0; i < needed; ++i) {
-            if (!impl->playQueue.empty()) {
-                out[i] = impl->playQueue.front();
-                impl->playQueue.pop_front();
-            } else {
-                out[i] = 0;
-            }
+        if (playbackTap) {
+            playbackTap(out, static_cast<int>(needed));
         }
     }
 
@@ -242,6 +252,12 @@ void AudioDevice::stopCapture()
     std::lock_guard<std::mutex> lock(m_impl->deviceMtx);
     if (m_impl->captureInitialized)
         ma_device_stop(&m_impl->captureDevice);
+}
+
+void AudioDevice::setPlaybackTap(PlaybackCallback cb)
+{
+    std::lock_guard<std::mutex> lock(m_impl->playMtx);
+    m_impl->playbackTap = std::move(cb);
 }
 
 void AudioDevice::play(const int16_t* pcm, int sampleCount)

@@ -257,6 +257,9 @@ struct Channel::Impl {
     mutable std::mutex              peersMtx;
 
     std::atomic<bool> running{false};
+    std::atomic<bool> signalingConnected{false};
+    std::chrono::steady_clock::time_point lastReconnectAttempt =
+        std::chrono::steady_clock::now() - std::chrono::seconds(10);
 
     // ── Debug 計數器（每 5 秒由 tick() 列印）────────────────
     std::atomic<int> dbgCapture{0};   // miniaudio 送進來的幀數（DTX 前）
@@ -291,6 +294,160 @@ struct Channel::Impl {
         std::string msg = line + '\n';
         int sent = ::send(sigSock, msg.c_str(), static_cast<int>(msg.size()), 0);
         return sent == static_cast<int>(msg.size());
+    }
+
+    void closeSignalingSocket() {
+        std::lock_guard<std::mutex> lk(sigSendMtx);
+        if (sigSock != INVALID_SOCKET) {
+            closesocket(sigSock);
+            sigSock = INVALID_SOCKET;
+        }
+        signalingConnected = false;
+    }
+
+    bool reconnectSignaling() {
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(
+                now - lastReconnectAttempt).count() < 3)
+            return false;
+        lastReconnectAttempt = now;
+
+        SOCKET newSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (newSock == INVALID_SOCKET)
+            return false;
+
+        addrinfo hints{}, *res = nullptr;
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        char portStr[8];
+        snprintf(portStr, sizeof(portStr), "%u", config.signalingPort);
+
+        if (getaddrinfo(config.signalingServer.c_str(), portStr, &hints, &res) != 0) {
+            closesocket(newSock);
+            return false;
+        }
+
+        if (::connect(newSock, res->ai_addr,
+                      static_cast<int>(res->ai_addrlen)) != 0) {
+            freeaddrinfo(res);
+            closesocket(newSock);
+            return false;
+        }
+
+        char srvIp[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET,
+                  &reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr,
+                  srvIp, sizeof(srvIp));
+        serverIp = srvIp;
+        selfLanIp = getSocketLocalIp(newSock);
+        freeaddrinfo(res);
+
+        {
+            std::lock_guard<std::mutex> lk(sigSendMtx);
+            if (sigSock != INVALID_SOCKET)
+                closesocket(sigSock);
+            sigSock = newSock;
+        }
+
+        std::vector<std::pair<std::string, std::string>> joinFields = {
+            {"cmd",       "JOIN"},
+            {"channelId", config.channelId},
+            {"playerId",  config.playerId},
+            {"token",     config.token},
+            {"udpPort",   std::to_string(selfLocalUdpPort)},
+            {"ssrc",      std::to_string(mySsrc)}
+        };
+        if (!selfLanIp.empty())
+            joinFields.push_back({"lanIp", selfLanIp});
+        if (!selfPublicIp.empty()) {
+            joinFields.push_back({"publicIp", selfPublicIp});
+            joinFields.push_back({"publicPort", std::to_string(selfPublicPort)});
+        }
+        if (!sendSigLine(jBuild(joinFields))) {
+            closeSignalingSocket();
+            return false;
+        }
+
+        std::string firstLine;
+        std::string remaining;
+        char buf[4096];
+        DWORD tv = 5000;
+        setsockopt(sigSock, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&tv), sizeof(tv));
+        while (true) {
+            int n = recv(sigSock, buf, sizeof(buf) - 1, 0);
+            if (n <= 0) {
+                closeSignalingSocket();
+                return false;
+            }
+            buf[n] = '\0';
+            remaining += buf;
+            auto pos = remaining.find('\n');
+            if (pos != std::string::npos) {
+                firstLine = remaining.substr(0, pos);
+                sigBuf = remaining.substr(pos + 1);
+                break;
+            }
+        }
+        tv = 0;
+        setsockopt(sigSock, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&tv), sizeof(tv));
+
+        if (jStr(firstLine, "cmd") != "JOINED") {
+            closeSignalingSocket();
+            return false;
+        }
+
+        serverRelayPort =
+            static_cast<uint16_t>(jInt(firstLine, "relayPort", 40000));
+
+        std::map<std::string, PeerConn> newPeers;
+        for (auto& obj : jArr(firstLine, "peers")) {
+            PeerConn pc;
+            pc.playerId = jStr(obj, "playerId");
+            pc.lanIp = jStr(obj, "lanIp");
+            pc.lanPort = static_cast<uint16_t>(jInt(obj, "lanPort"));
+            pc.publicIp = jStr(obj, "publicIp");
+            pc.publicPort = static_cast<uint16_t>(jInt(obj, "publicPort"));
+            pc.signaledIp = pc.publicIp;
+            pc.signaledPort = pc.publicPort;
+            refreshPeerEndpoint(pc);
+            pc.ssrc = static_cast<uint32_t>(jInt(obj, "ssrc"));
+            pc.punchStart = std::chrono::steady_clock::now();
+            {
+                std::lock_guard<std::mutex> lk(peersMtx);
+                auto it = peers.find(pc.playerId);
+                if (it != peers.end()) {
+                    pc.decoder = std::move(it->second.decoder);
+                    pc.decoderInit = it->second.decoderInit;
+                    pc.jitter = std::move(it->second.jitter);
+                    pc.speaking = it->second.speaking;
+                    pc.silentFrames = it->second.silentFrames;
+                }
+            }
+            newPeers[pc.playerId] = std::move(pc);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(peersMtx);
+            for (auto& [id, peer] : peers) {
+                if (newPeers.find(id) == newPeers.end()) {
+                    mixer.remove(id);
+                    if (events.onPeerLeft) events.onPeerLeft(id);
+                }
+            }
+            for (auto& [id, peer] : newPeers) {
+                if (peers.find(id) == peers.end() && events.onPeerJoined)
+                    events.onPeerJoined(id);
+            }
+            peers = std::move(newPeers);
+        }
+
+        signalingConnected = true;
+        if (sigThread.joinable())
+            sigThread.join();
+        sigThread = std::thread([this]() { runSigThread(); });
+        return true;
     }
 
     void handleNetworkChange() {
@@ -359,6 +516,10 @@ struct Channel::Impl {
     void runNetworkThread() {
         while (running.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (!signalingConnected.load()) {
+                reconnectSignaling();
+                continue;
+            }
             handleNetworkChange();
         }
     }
@@ -671,9 +832,11 @@ struct Channel::Impl {
         while (running.load()) {
             int n = recv(sigSock, buf, static_cast<int>(sizeof(buf)) - 1, 0);
             if (n <= 0) {
-                if (running.load() && events.onError)
-                    events.onError("Signaling disconnected");
-                running = false;
+                if (running.load()) {
+                    closeSignalingSocket();
+                    if (events.onError)
+                        events.onError("Signaling disconnected, reconnecting...");
+                }
                 return;
             }
             buf[n] = '\0';
@@ -917,6 +1080,7 @@ bool Channel::join(const ChannelConfig& cfg, const ChannelEvents& events) {
 
     m_impl->serverRelayPort =
         static_cast<uint16_t>(jInt(firstLine, "relayPort", 40000));
+    m_impl->signalingConnected = true;
 
     // 解析既有 peers
     {

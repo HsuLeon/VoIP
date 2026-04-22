@@ -21,8 +21,20 @@ struct ChannelConfig {
     std::string token;
     std::string channelId;
     std::string playerId;
-    bool        enableDenoise = true;
+
+    // Audio tuning
+    int         opusBitrate = 32000;
+    float       captureVadDb = -50.0f;
+    int         captureHangoverFrames = 12;
+
+    // Echo cancellation tuning
     bool        enableEchoCancel = true;
+    int         aecFilterMs = 200;
+    int         aecEchoSuppress = -40;
+    int         aecEchoSuppressActive = -15;
+
+    // Denoise
+    bool        enableDenoise = true;
 };
 
 struct ChannelEvents {

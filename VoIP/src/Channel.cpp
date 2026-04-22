@@ -211,6 +211,7 @@ struct Channel::Impl {
     // Signaling TCP
     SOCKET        sigSock = INVALID_SOCKET;
     std::thread   sigThread;
+    std::thread   networkThread;
     std::string   sigBuf;  // TCP 剩餘接收緩衝
 
     // UDP（RTP direct + TURN relay）
@@ -353,6 +354,13 @@ struct Channel::Impl {
             {"publicPort", std::to_string(newPublicPort)}
         });
         sendSigLine(updateMsg);
+    }
+
+    void runNetworkThread() {
+        while (running.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            handleNetworkChange();
+        }
     }
 
     bool initDenoise() {
@@ -942,6 +950,9 @@ bool Channel::join(const ChannelConfig& cfg, const ChannelEvents& events) {
     m_impl->sigThread = std::thread([impl = m_impl]() {
         impl->runSigThread();
     });
+    m_impl->networkThread = std::thread([impl = m_impl]() {
+        impl->runNetworkThread();
+    });
 
     // ── Step 9: 啟動收音（miniaudio 非同步執行緒）
     m_impl->lastPlaybackGeneration = m_impl->audio.playbackGeneration();
@@ -974,6 +985,7 @@ void Channel::leave() {
         m_impl->sigSock = INVALID_SOCKET;
     }
     if (m_impl->sigThread.joinable()) m_impl->sigThread.join();
+    if (m_impl->networkThread.joinable()) m_impl->networkThread.join();
 
     // 停止 UDP
     m_impl->udp.stopRecv();
@@ -1015,7 +1027,6 @@ void Channel::tick() {
     if (!m_impl->joined) return;
 
     auto now = std::chrono::steady_clock::now();
-    m_impl->handleNetworkChange();
     const uint64_t playbackGen = m_impl->audio.playbackGeneration();
     if (playbackGen != m_impl->lastPlaybackGeneration) {
         m_impl->lastPlaybackGeneration = playbackGen;

@@ -31,7 +31,13 @@ struct Args {
     std::string token = "test";
     std::string channelId = "guild_123";
     std::string playerId = "player_A";
-    bool ipcOnly = false;
+    bool ipcOnly = true;
+    bool autoJoin = false;
+    bool hasJoinArgs = false;
+    bool serverProvided = false;
+    bool tokenProvided = false;
+    bool channelProvided = false;
+    bool playerProvided = false;
 };
 
 Args parseArgs(int argc, char* argv[]) {
@@ -41,6 +47,13 @@ Args parseArgs(int argc, char* argv[]) {
 
         if (key == "--ipc-only") {
             args.ipcOnly = true;
+            args.autoJoin = false;
+            continue;
+        }
+
+        if (key == "--auto-join") {
+            args.autoJoin = true;
+            args.ipcOnly = false;
             continue;
         }
 
@@ -58,26 +71,49 @@ Args parseArgs(int argc, char* argv[]) {
             } else {
                 args.serverHost = val;
             }
+            args.hasJoinArgs = true;
+            args.serverProvided = true;
             ++i;
             continue;
         }
         if (key == "--token") {
             args.token = val;
+            args.hasJoinArgs = true;
+            args.tokenProvided = true;
             ++i;
             continue;
         }
         if (key == "--channel") {
             args.channelId = val;
+            args.hasJoinArgs = true;
+            args.channelProvided = true;
             ++i;
             continue;
         }
         if (key == "--player") {
             args.playerId = val;
+            args.hasJoinArgs = true;
+            args.playerProvided = true;
             ++i;
             continue;
         }
     }
+
+    if (!args.autoJoin && args.hasJoinArgs) {
+        args.autoJoin = true;
+        args.ipcOnly = false;
+    }
+
     return args;
+}
+
+bool hasCompleteJoinArgs(const Args& args) {
+    return args.serverProvided && args.tokenProvided &&
+           args.channelProvided && args.playerProvided;
+}
+
+bool hasPartialJoinArgs(const Args& args) {
+    return args.hasJoinArgs && !hasCompleteJoinArgs(args);
 }
 
 std::string readTextFile(const std::string& path) {
@@ -348,6 +384,18 @@ int main(int argc, char* argv[]) {
 
     const Args args = parseArgs(argc, argv);
 
+    if (hasPartialJoinArgs(args)) {
+        std::cerr << "[WARN] Incomplete startup arguments.\n";
+        std::cerr << "       To auto-join on startup, provide all of:\n";
+        std::cerr << "       --server <host:port> --token <token> "
+                     "--channel <channelId> --player <playerId>\n";
+        std::cerr << "       Example:\n";
+        std::cerr << "       Client.exe --server 127.0.0.1:7000 --token test "
+                     "--channel guild_123 --player playerA\n";
+        std::cerr << "       Or run Client.exe without arguments to use IPC mode.\n";
+        return 1;
+    }
+
     std::cout << "========================================\n";
     std::cout << "  VoIP Client  [TEST BUILD]\n";
     std::cout << "  Server  : " << args.serverHost << ":" << args.serverPort << "\n";
@@ -356,7 +404,8 @@ int main(int argc, char* argv[]) {
     std::cout << "========================================\n";
     std::cout << "  q+Enter = quit\n";
     std::cout << "  m+Enter = toggle mute\n";
-    std::cout << "  --ipc-only = wait for GameClientMock IPC commands\n";
+    std::cout << "  Default mode = IPC only\n";
+    std::cout << "  --auto-join  = join on startup with CLI/config values\n";
     std::cout << "========================================\n\n";
 
     VoIP::Channel channel;
@@ -588,12 +637,13 @@ int main(int argc, char* argv[]) {
                   << "\n";
     }
 
-    if (!args.ipcOnly) {
+    if (args.autoJoin) {
         if (!joinCurrentConfig("startup")) {
             return 1;
         }
     } else {
-        std::cout << "[*] IPC-only mode. Waiting for GameClientMock commands.\n";
+        std::cout << "[*] Running in IPC mode.\n";
+        std::cout << "[*] Waiting for GameClientMock / game client commands.\n";
     }
 
     std::thread inputThread([&]() {

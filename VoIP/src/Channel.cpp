@@ -231,6 +231,7 @@ struct Channel::Impl {
     std::vector<int16_t> echoBuf;
     std::vector<int16_t> playbackRefBuf;
     int           echoPlaybackFramesQueued = 0;
+    int           echoPlaybackFramesFed = 0;
     std::vector<float> denoiseInBuf;
     std::vector<float> denoiseOutBuf;
     uint64_t      lastCaptureGeneration = 0;
@@ -362,6 +363,7 @@ struct Channel::Impl {
         echoBuf.clear();
         playbackRefBuf.clear();
         echoPlaybackFramesQueued = 0;
+        echoPlaybackFramesFed = 0;
     }
 
     void resetEchoCancel() {
@@ -380,6 +382,9 @@ struct Channel::Impl {
             speex_echo_playback(echoState, playbackRefBuf.data());
             playbackRefBuf.erase(playbackRefBuf.begin(),
                                  playbackRefBuf.begin() + FRAME_SAMPLES);
+            ++echoPlaybackFramesFed;
+            if (echoPlaybackFramesFed <= 1)
+                continue; // Speex drops the first playback frame as warm-up.
             if (echoPlaybackFramesQueued < 8)
                 ++echoPlaybackFramesQueued;
         }

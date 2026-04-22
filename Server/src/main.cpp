@@ -133,6 +133,7 @@ struct ClientSession {
     std::string playerId;
     std::string channelId;
     uint16_t    localUdpPort = 0;
+    std::string lanIp;
     std::string publicIp;
     uint16_t    publicPort  = 0;
     uint32_t    ssrc        = 0;
@@ -214,6 +215,8 @@ static void broadcastPeerAddr(const std::shared_ptr<ClientSession>& session,
     std::string peerAddrMsg = jBuild({
         {"cmd",        "PEER_ADDR"},
         {"playerId",   session->playerId},
+        {"lanIp",      session->lanIp},
+        {"lanPort",    std::to_string(session->localUdpPort)},
         {"publicIp",   session->publicIp},
         {"publicPort", std::to_string(session->publicPort)}
     });
@@ -259,6 +262,7 @@ static void handleClient(SOCKET clientSock, std::string peerIp) {
     session->playerId   = jStr(joinLine, "playerId");
     session->channelId  = jStr(joinLine, "channelId");
     session->localUdpPort = static_cast<uint16_t>(jInt(joinLine, "udpPort"));
+    session->lanIp      = jStr(joinLine, "lanIp");
     session->publicIp   = jStr(joinLine, "publicIp");
     session->publicPort = static_cast<uint16_t>(jInt(joinLine, "publicPort"));
     if (session->publicIp.empty()) session->publicIp = peerIp;
@@ -276,6 +280,7 @@ static void handleClient(SOCKET clientSock, std::string peerIp) {
               << "  channel=" << session->channelId
               << "  tcpIp=" << peerIp
               << "  localUdpPort=" << session->localUdpPort
+              << "  lanIp=" << (session->lanIp.empty() ? "-" : session->lanIp)
               << "  advertised=" << session->publicIp << ":" << session->publicPort
               << "  ssrc=" << session->ssrc << "\n";
 
@@ -300,6 +305,8 @@ static void handleClient(SOCKET clientSock, std::string peerIp) {
                     if (!first) peersArr += ',';
                     peersArr += jBuild({
                         {"playerId",   s->playerId},
+                        {"lanIp",      s->lanIp},
+                        {"lanPort",    std::to_string(s->localUdpPort)},
                         {"publicIp",   s->publicIp},
                         {"publicPort", std::to_string(s->publicPort)},
                         {"ssrc",       std::to_string(s->ssrc)}
@@ -337,6 +344,8 @@ static void handleClient(SOCKET clientSock, std::string peerIp) {
         std::string peerJoinMsg = jBuild({
             {"cmd",        "PEER_JOIN"},
             {"playerId",   session->playerId},
+            {"lanIp",      session->lanIp},
+            {"lanPort",    std::to_string(session->localUdpPort)},
             {"publicIp",   session->publicIp},
             {"publicPort", std::to_string(session->publicPort)},
             {"ssrc",       std::to_string(session->ssrc)}

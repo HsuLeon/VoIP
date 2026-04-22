@@ -139,6 +139,17 @@ bool isJsonRawValue(const std::string& v) {
     return hasDigits;
 }
 
+std::string getSocketLocalIp(SOCKET sock) {
+    sockaddr_in local{};
+    int len = sizeof(local);
+    if (getsockname(sock, reinterpret_cast<sockaddr*>(&local), &len) != 0)
+        return {};
+    char ip[INET_ADDRSTRLEN] = {};
+    if (!inet_ntop(AF_INET, &local.sin_addr, ip, sizeof(ip)))
+        return {};
+    return ip;
+}
+
 std::string jBuild(std::vector<std::pair<std::string, std::string>> fields) {
     std::string s = "{";
     for (size_t i = 0; i < fields.size(); ++i) {
@@ -159,6 +170,8 @@ std::string jBuild(std::vector<std::pair<std::string, std::string>> fields) {
 struct PeerConn {
     // 識別
     std::string  playerId;
+    std::string  lanIp;
+    uint16_t     lanPort = 0;
     std::string  publicIp;
     uint16_t     publicPort  = 0;
     std::string  signaledIp;
@@ -204,6 +217,9 @@ struct Channel::Impl {
     UdpSocket     udp;
     std::string   serverIp;
     uint16_t      serverRelayPort = 40000;
+    std::string   selfLanIp;
+    std::string   selfPublicIp;
+    uint16_t      selfLocalUdpPort = 0;
 
     // 音訊管線
     AudioDevice   audio;
@@ -247,6 +263,20 @@ struct Channel::Impl {
         std::chrono::steady_clock::now(); // 初始化為現在，避免啟動即觸發
 
     // ── 捕獲音訊（miniaudio 執行緒呼叫）─────────────────────
+    void refreshPeerEndpoint(PeerConn& peer) {
+        peer.publicIp   = peer.signaledIp;
+        peer.publicPort = peer.signaledPort;
+        if (!selfPublicIp.empty() &&
+            !selfLanIp.empty() &&
+            !peer.lanIp.empty() &&
+            peer.lanPort != 0 &&
+            peer.signaledIp == selfPublicIp)
+        {
+            peer.publicIp   = peer.lanIp;
+            peer.publicPort = peer.lanPort;
+        }
+    }
+
     bool initDenoise() {
         shutdownDenoise();
         if (!config.enableDenoise) return true;
@@ -560,10 +590,13 @@ struct Channel::Impl {
         if (cmd == "PEER_JOIN") {
             PeerConn pc;
             pc.playerId   = jStr(line, "playerId");
+            pc.lanIp      = jStr(line, "lanIp");
+            pc.lanPort    = static_cast<uint16_t>(jInt(line, "lanPort"));
             pc.publicIp   = jStr(line, "publicIp");
             pc.publicPort = static_cast<uint16_t>(jInt(line, "publicPort"));
             pc.signaledIp = pc.publicIp;
             pc.signaledPort = pc.publicPort;
+            refreshPeerEndpoint(pc);
             pc.ssrc       = static_cast<uint32_t>(jInt(line, "ssrc"));
             pc.punchStart = std::chrono::steady_clock::now();
             std::string pid = pc.playerId; // move 前先保存，move 後 pc.playerId 會被清空
@@ -575,14 +608,19 @@ struct Channel::Impl {
 
         } else if (cmd == "PEER_ADDR") {
             std::string pid = jStr(line, "playerId");
+            std::string lanIp = jStr(line, "lanIp");
+            uint16_t lanPort  = static_cast<uint16_t>(jInt(line, "lanPort"));
             std::string ip  = jStr(line, "publicIp");
             uint16_t port   = static_cast<uint16_t>(jInt(line, "publicPort"));
             if (!pid.empty() && !ip.empty() && port != 0) {
                 std::lock_guard<std::mutex> lk(peersMtx);
                 auto it = peers.find(pid);
                 if (it != peers.end()) {
-                    it->second.publicIp   = ip;
-                    it->second.publicPort = port;
+                    if (!lanIp.empty()) it->second.lanIp = lanIp;
+                    if (lanPort != 0) it->second.lanPort = lanPort;
+                    it->second.signaledIp   = ip;
+                    it->second.signaledPort = port;
+                    refreshPeerEndpoint(it->second);
                     it->second.lastLearnedIp = ip;
                     it->second.lastLearnedPort = port;
                     it->second.punchDone  = false;
@@ -693,6 +731,7 @@ bool Channel::join(const ChannelConfig& cfg, const ChannelEvents& events) {
               &reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr,
               srvIp, sizeof(srvIp));
     m_impl->serverIp = srvIp;
+    m_impl->selfLanIp = getSocketLocalIp(m_impl->sigSock);
     freeaddrinfo(res);
 
     StunResult stunResult;
@@ -705,6 +744,9 @@ bool Channel::join(const ChannelConfig& cfg, const ChannelEvents& events) {
         stunResult = m_impl->udp.queryStun(kStunServers[i], kStunPorts[i]);
         if (stunResult.success) break;
     }
+    m_impl->selfLocalUdpPort = localUdpPort;
+    if (stunResult.success)
+        m_impl->selfPublicIp = stunResult.publicIp;
 
     // ── Step 5: 送出 JOIN
     std::vector<std::pair<std::string, std::string>> joinFields = {
@@ -715,6 +757,8 @@ bool Channel::join(const ChannelConfig& cfg, const ChannelEvents& events) {
         {"udpPort",   std::to_string(localUdpPort)},
         {"ssrc",      std::to_string(m_impl->mySsrc)}
     };
+    if (!m_impl->selfLanIp.empty())
+        joinFields.push_back({"lanIp", m_impl->selfLanIp});
     if (stunResult.success) {
         joinFields.push_back({"publicIp", stunResult.publicIp});
         joinFields.push_back({"publicPort", std::to_string(stunResult.publicPort)});
@@ -774,10 +818,13 @@ bool Channel::join(const ChannelConfig& cfg, const ChannelEvents& events) {
         for (auto& obj : jArr(firstLine, "peers")) {
             PeerConn pc;
             pc.playerId   = jStr(obj, "playerId");
+            pc.lanIp      = jStr(obj, "lanIp");
+            pc.lanPort    = static_cast<uint16_t>(jInt(obj, "lanPort"));
             pc.publicIp   = jStr(obj, "publicIp");
             pc.publicPort = static_cast<uint16_t>(jInt(obj, "publicPort"));
             pc.signaledIp = pc.publicIp;
             pc.signaledPort = pc.publicPort;
+            m_impl->refreshPeerEndpoint(pc);
             pc.ssrc       = static_cast<uint32_t>(jInt(obj, "ssrc"));
             pc.punchStart = std::chrono::steady_clock::now();
             if (events.onPeerJoined) events.onPeerJoined(pc.playerId);

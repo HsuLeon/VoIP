@@ -444,6 +444,8 @@ struct Channel::Impl {
             // -35 dB ≈ max 音量的 1.8%，可過濾鍵盤聲/風扇聲，保留正常說話聲
             // 若說話時仍被過濾，請在 Windows 設定中提高麥克風增益
             constexpr float NOISE_GATE_DB = -20.0f; // 提高門檻：過濾整合音效卡 100% 增益時的底噪（約 -25dB）
+            constexpr float CAPTURE_VAD_DB = -50.0f;
+            constexpr int CAPTURE_HANGOVER_FRAMES = 12;
 
             while (static_cast<int>(captureBuf.size()) >= FRAME_SAMPLES) {
                 ++dbgCapture; // 每幀都計數（噪音閘前）
@@ -455,9 +457,10 @@ struct Channel::Impl {
                 applyDenoise(frame, FRAME_SAMPLES);
 
                 const bool activeNow =
-                    AudioDevice::detectVoice(frame, FRAME_SAMPLES, -45.0f);
+                    AudioDevice::detectVoice(frame, FRAME_SAMPLES,
+                                             CAPTURE_VAD_DB);
                 if (activeNow) {
-                    captureHangoverFrames = 6;
+                    captureHangoverFrames = CAPTURE_HANGOVER_FRAMES;
                 } else if (captureHangoverFrames > 0) {
                     --captureHangoverFrames;
                 }

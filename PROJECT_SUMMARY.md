@@ -202,6 +202,8 @@ The solution now also includes:
 
 - `GameClientMock`
   A console project that simulates the future game client and talks to `VoIPClient.exe` through local IPC
+- `GameClientMock/src/CVoIP.*`
+  A small wrapper used by the mock game client to own VoIPClient launch/attach, IPC commands, heartbeat, and shutdown behavior
 
 IPC is currently implemented as a transport-selectable local channel:
 

@@ -5,14 +5,17 @@
 #include "VoIP/VoIP.h"
 
 #include <atomic>
+#include <chrono>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
 
 std::atomic<bool> g_running{true};
+constexpr int HEARTBEAT_INTERVAL_MS = 1000;
 
 BOOL WINAPI consoleCtrlHandler(DWORD) {
     g_running = false;
@@ -22,6 +25,11 @@ BOOL WINAPI consoleCtrlHandler(DWORD) {
 struct Args {
     bool valid = false;
     VoIP::IpcOptions ipc;
+#ifdef _DEBUG
+    bool showVoipConsole = true;
+#else
+    bool showVoipConsole = false;
+#endif
 };
 
 struct ChildProcess {
@@ -31,8 +39,8 @@ struct ChildProcess {
 
 void printUsage() {
     std::cerr << "Usage:\n";
-    std::cerr << "  GameClientMock.exe --ipc-type socket [--ipc-port 17832]\n";
-    std::cerr << "  GameClientMock.exe --ipc-type namedPipe [--ipc-name RanOnlineVoIP]\n";
+    std::cerr << "  GameClientMock.exe --ipc-type socket [--ipc-port 17832] [--show-voip-console|--hide-voip-console]\n";
+    std::cerr << "  GameClientMock.exe --ipc-type namedPipe [--ipc-name RanOnlineVoIP] [--show-voip-console|--hide-voip-console]\n";
 }
 
 bool parseIpcType(const std::string& text, VoIP::IpcTransport& out) {
@@ -122,13 +130,14 @@ bool launchVoipClient(const Args& args, ChildProcess& child) {
     STARTUPINFOA si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
+    DWORD creationFlags = args.showVoipConsole ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
     if (!CreateProcessA(
             exePath.c_str(),
             cmdLine.data(),
             nullptr,
             nullptr,
             FALSE,
-            CREATE_NEW_CONSOLE,
+            creationFlags,
             nullptr,
             dir.c_str(),
             &si,
@@ -139,7 +148,8 @@ bool launchVoipClient(const Args& args, ChildProcess& child) {
 
     child.pi = pi;
     child.launched = true;
-    std::cout << "[*] Launched VoIPClient.exe\n";
+    std::cout << "[*] Launched VoIPClient.exe"
+              << (args.showVoipConsole ? " with console\n" : " without console\n");
     return true;
 }
 
@@ -208,6 +218,16 @@ Args parseArgs(int argc, char* argv[]) {
     Args args;
     for (int i = 1; i < argc; ++i) {
         const std::string key = argv[i];
+
+        if (key == "--show-voip-console") {
+            args.showVoipConsole = true;
+            continue;
+        }
+        if (key == "--hide-voip-console") {
+            args.showVoipConsole = false;
+            continue;
+        }
+
         if (i + 1 >= argc) {
             continue;
         }
@@ -295,6 +315,8 @@ int main(int argc, char* argv[]) {
     } else {
         std::cout << "  Target   : \\\\.\\pipe\\" << args.ipc.pipeName << "\n";
     }
+    std::cout << "  VoIP UI  : "
+              << (args.showVoipConsole ? "show console" : "hide console") << "\n";
     std::cout << "========================================\n";
 
     VoIP::IpcClient ipc;
@@ -319,6 +341,13 @@ int main(int argc, char* argv[]) {
 
     ipc.send("{\"ver\":1,\"cmd\":\"HELLO\"}");
     ipc.send("{\"ver\":1,\"cmd\":\"STATUS\"}");
+
+    std::thread heartbeatThread([&]() {
+        while (g_running.load()) {
+            ipc.send("{\"ver\":1,\"cmd\":\"HEARTBEAT\"}");
+            std::this_thread::sleep_for(std::chrono::milliseconds(HEARTBEAT_INTERVAL_MS));
+        }
+    });
 
     printHelp();
     std::cout << "\n";
@@ -406,6 +435,7 @@ int main(int argc, char* argv[]) {
             continue;
         }
         if (cmd == "quit" || cmd == "exit") {
+            g_running = false;
             break;
         }
 
@@ -413,7 +443,12 @@ int main(int argc, char* argv[]) {
         printHelp();
     }
 
-    if (!quitClientSent && isChildRunning(voipClient)) {
+    g_running = false;
+    if (heartbeatThread.joinable()) {
+        heartbeatThread.join();
+    }
+
+    if (!quitClientSent) {
         ipc.send("{\"ver\":1,\"cmd\":\"QUIT\"}");
         quitClientSent = true;
     }

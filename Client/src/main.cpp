@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
@@ -17,6 +18,14 @@
 namespace {
 
 std::atomic<bool> g_running{true};
+constexpr int IPC_HEARTBEAT_TIMEOUT_MS = 10000;
+constexpr int IPC_SHUTDOWN_GRACE_MS = 5000;
+
+int64_t nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 BOOL WINAPI consoleCtrlHandler(DWORD) {
     g_running = false;
@@ -429,8 +438,13 @@ int main(int argc, char* argv[]) {
         std::cout << "  Player  : " << args.playerId << "\n";
     }
     std::cout << "========================================\n";
-    std::cout << "  q+Enter = quit\n";
-    std::cout << "  m+Enter = toggle mute\n";
+    if (ipcMode) {
+        std::cout << "  Controlled by IPC game client\n";
+        std::cout << "  Heartbeat timeout: " << IPC_HEARTBEAT_TIMEOUT_MS << " ms\n";
+    } else {
+        std::cout << "  q+Enter = quit\n";
+        std::cout << "  m+Enter = toggle mute\n";
+    }
     std::cout << "========================================\n\n";
 
     VoIP::Channel channel;
@@ -445,6 +459,7 @@ int main(int argc, char* argv[]) {
     std::mutex channelMtx;
     std::mutex cfgMtx;
     std::atomic<bool> joined{false};
+    std::atomic<int64_t> lastIpcHeartbeatMs{nowMs()};
 
     VoIP::IpcServer ipc;
     const auto sendIpc = [&](const std::string& json) {
@@ -541,7 +556,13 @@ int main(int argc, char* argv[]) {
                 const std::string cmd = jStr(jsonMsg, "cmd");
                 if (cmd.empty()) return;
 
+                if (cmd == "HEARTBEAT") {
+                    lastIpcHeartbeatMs = nowMs();
+                    return;
+                }
+
                 if (cmd == "HELLO") {
+                    lastIpcHeartbeatMs = nowMs();
                     sendIpc(buildSimpleEventJson("READY"));
                     sendState();
                     return;
@@ -673,31 +694,37 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::thread inputThread([&]() {
-        std::string line;
-        while (g_running && std::getline(std::cin, line)) {
-            if (line == "m" || line == "M") {
-                bool muted = false;
-                {
-                    std::lock_guard<std::mutex> channelLock(channelMtx);
-                    muted = !channel.isMuted();
-                    channel.setMuted(muted);
+    std::thread inputThread;
+    if (!ipcMode) {
+        inputThread = std::thread([&]() {
+            std::string line;
+            while (g_running && std::getline(std::cin, line)) {
+                if (line == "m" || line == "M") {
+                    bool muted = false;
+                    {
+                        std::lock_guard<std::mutex> channelLock(channelMtx);
+                        muted = !channel.isMuted();
+                        channel.setMuted(muted);
+                    }
+                    std::cout << (muted ? "[MIC] Muted\n" : "[MIC] Unmuted\n");
+                } else if (line == "q" || line == "Q" || line == "quit") {
+                    g_running = false;
+                    break;
                 }
-                std::cout << (muted ? "[MIC] Muted\n" : "[MIC] Unmuted\n");
-                if (ipcMode) {
-                    sendIpc(buildSimpleEventJson("MUTE_CHANGED"));
-                    sendState();
-                }
-            } else if (line == "q" || line == "Q" || line == "quit") {
-                g_running = false;
-                break;
             }
-        }
-        g_running = false;
-    });
+            g_running = false;
+        });
+    }
 
     auto nextTick = std::chrono::steady_clock::now();
     while (g_running) {
+        if (ipcMode &&
+            nowMs() - lastIpcHeartbeatMs.load() > IPC_HEARTBEAT_TIMEOUT_MS) {
+            std::cerr << "[ERR] IPC heartbeat timeout. Closing VoIP client.\n";
+            g_running = false;
+            break;
+        }
+
         {
             std::lock_guard<std::mutex> channelLock(channelMtx);
             channel.tick();
@@ -706,18 +733,47 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_until(nextTick);
     }
 
-    std::cout << "\n[*] Leaving channel...\n";
-    {
-        std::lock_guard<std::mutex> channelLock(channelMtx);
-        if (joined.load()) {
-            channel.leave();
-            joined = false;
+    const auto shutdownWork = [&]() {
+        std::cout << "\n[*] Leaving channel...\n";
+        {
+            std::lock_guard<std::mutex> channelLock(channelMtx);
+            if (joined.load()) {
+                channel.leave();
+                joined = false;
+            }
         }
-    }
+        if (ipcMode) {
+            ipc.stop();
+        }
+        std::cout << "[*] Done.\n";
+    };
+
     if (ipcMode) {
-        ipc.stop();
+        std::atomic<bool> shutdownDone{false};
+        std::thread shutdownThread([&]() {
+            shutdownWork();
+            shutdownDone = true;
+        });
+
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(IPC_SHUTDOWN_GRACE_MS);
+        while (!shutdownDone.load() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        if (!shutdownDone.load()) {
+            std::cerr << "[ERR] IPC shutdown grace period exceeded. Forcing VoIP client exit.\n";
+            ExitProcess(0);
+        }
+
+        if (shutdownThread.joinable()) {
+            shutdownThread.join();
+        }
+    } else {
+        shutdownWork();
     }
-    std::cout << "[*] Done.\n";
 
     if (inputThread.joinable()) {
         inputThread.join();

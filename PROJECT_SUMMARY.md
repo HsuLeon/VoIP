@@ -257,11 +257,21 @@ Or:
 GameClientMock.exe --ipc-type namedPipe --ipc-name RanOnlineVoIP
 ```
 
+For production-like testing where the voice client should run in the background:
+
+```powershell
+GameClientMock.exe --ipc-type namedPipe --ipc-name RanOnlineVoIP --hide-voip-console
+```
+
 Note:
 
 - `VoIPClient.exe` must be in the same folder as `GameClientMock.exe`
-- If `GameClientMock.exe` launched `VoIPClient.exe`, normal `GameClientMock.exe` exit asks that launched voice client to quit
-- If `GameClientMock.exe` attached to an already-running `VoIPClient.exe`, it does not automatically terminate that existing process; use `quit-client` when you explicitly want to close it
+- `GameClientMock.exe` shows the launched `VoIPClient.exe` console by default for development
+- Add `--hide-voip-console` when the launched voice client should run without a visible terminal window
+- When `GameClientMock.exe` exits normally, it asks `VoIPClient.exe` to quit, whether it launched or attached to that voice client
+- `GameClientMock.exe` sends an IPC `HEARTBEAT` every second
+- In IPC mode, `VoIPClient.exe` automatically exits if it does not receive a heartbeat for about 10 seconds
+- In IPC mode, shutdown first attempts a graceful channel/audio/network cleanup; if cleanup blocks for several seconds, the background voice client forces its own process exit
 - The public IPC name is the base name such as `RanOnlineVoIP`
 - Internally, the implementation uses separate one-way named pipes for stability, but that detail is hidden from the caller
 
@@ -307,6 +317,7 @@ Important notes:
 Game-side commands currently supported:
 
 - `HELLO`
+- `HEARTBEAT`
 - `STATUS`
 - `LOGIN`
 - `JOIN`

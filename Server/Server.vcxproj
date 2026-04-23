@@ -75,6 +75,9 @@
             Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <TargetName>VoIPServer</TargetName>
+  </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <OutDir>$(SolutionDir)build\x86\Debug\</OutDir>
     <IntDir>$(SolutionDir)build\int\$(ProjectName)\Debug\x86\</IntDir>

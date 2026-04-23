@@ -21,9 +21,9 @@ The solution is split into four main projects:
 - `VoIP`
   Shared static library containing audio I/O, codec, RTP, NAT traversal, jitter, mixing, and channel logic
 - `Client`
-  Test client executable that joins a channel, captures microphone audio, plays remote audio, and prints debug status
+  Builds `VoIPClient.exe`, the voice client executable used by tests and future game integration
 - `Server`
-  Signaling server plus TURN-like UDP relay
+  Builds `VoIPServer.exe`, the signaling server plus TURN-like UDP relay
 - `Test`
   Test executable for core logic validation
 
@@ -201,12 +201,12 @@ Example format:
 The solution now also includes:
 
 - `GameClientMock`
-  A console project that simulates the future game client and talks to `Client.exe` through local IPC
+  A console project that simulates the future game client and talks to `VoIPClient.exe` through local IPC
 
 IPC is currently implemented as a transport-selectable local channel:
 
 - JSON message protocol shared across all IPC modes
-- `Client.exe` acts as the local IPC server
+- `VoIPClient.exe` acts as the local IPC server
 - `GameClientMock.exe` acts as the local IPC client
 - Supported IPC transports:
   - `socket`
@@ -214,7 +214,7 @@ IPC is currently implemented as a transport-selectable local channel:
 
 ### Client startup behavior
 
-`Client.exe` now supports two startup modes:
+`VoIPClient.exe` now supports two startup modes:
 
 - IPC mode:
   Requires `--ipc-type`
@@ -224,14 +224,14 @@ IPC is currently implemented as a transport-selectable local channel:
 IPC mode examples:
 
 ```powershell
-Client.exe --ipc-type socket --ipc-port 17832
-Client.exe --ipc-type namedPipe --ipc-name RanOnlineVoIP
+VoIPClient.exe --ipc-type socket --ipc-port 17832
+VoIPClient.exe --ipc-type namedPipe --ipc-name RanOnlineVoIP
 ```
 
 Direct startup example:
 
 ```powershell
-Client.exe --server 127.0.0.1:7000 --token test --channel guild_123 --player playerA
+VoIPClient.exe --server 127.0.0.1:7000 --token test --channel guild_123 --player playerA
 ```
 
 If the required arguments are incomplete or missing, the client prints a correct usage example and exits.
@@ -240,21 +240,21 @@ If the required arguments are incomplete or missing, the client prints a correct
 
 Recommended test flow:
 
-1. Start `Client.exe` with an IPC transport
+1. Start `VoIPClient.exe` with an IPC transport
 2. Start `GameClientMock.exe`
 3. Type commands into the `GameClientMock.exe` console and press Enter
 
 Example:
 
 ```powershell
-Client.exe --ipc-type socket --ipc-port 17832
+VoIPClient.exe --ipc-type socket --ipc-port 17832
 GameClientMock.exe --ipc-type socket --ipc-port 17832
 ```
 
 Or:
 
 ```powershell
-Client.exe --ipc-type namedPipe --ipc-name RanOnlineVoIP
+VoIPClient.exe --ipc-type namedPipe --ipc-name RanOnlineVoIP
 GameClientMock.exe --ipc-type namedPipe --ipc-name RanOnlineVoIP
 ```
 
@@ -298,7 +298,7 @@ Important notes:
 - `quit`
   Closes `GameClientMock.exe` only
 - `quit-client`
-  Sends an IPC command that asks `Client.exe` to terminate
+  Sends an IPC command that asks `VoIPClient.exe` to terminate
 
 ### Current IPC command/event direction
 

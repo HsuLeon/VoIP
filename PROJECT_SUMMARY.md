@@ -240,30 +240,32 @@ If the required arguments are incomplete or missing, the client prints a correct
 
 Recommended test flow:
 
-1. Start `VoIPClient.exe` with an IPC transport
-2. Start `GameClientMock.exe`
-3. Type commands into the `GameClientMock.exe` console and press Enter
+1. Start `GameClientMock.exe` with an IPC transport
+2. `GameClientMock.exe` first tries to attach to an existing `VoIPClient.exe` on the same IPC endpoint
+3. If no compatible IPC endpoint is found, `GameClientMock.exe` launches `VoIPClient.exe` from the same output folder and passes through the IPC arguments
+4. Type commands into the `GameClientMock.exe` console and press Enter
 
 Example:
 
 ```powershell
-VoIPClient.exe --ipc-type socket --ipc-port 17832
 GameClientMock.exe --ipc-type socket --ipc-port 17832
 ```
 
 Or:
 
 ```powershell
-VoIPClient.exe --ipc-type namedPipe --ipc-name RanOnlineVoIP
 GameClientMock.exe --ipc-type namedPipe --ipc-name RanOnlineVoIP
 ```
 
 Note:
 
+- `VoIPClient.exe` must be in the same folder as `GameClientMock.exe`
+- If `GameClientMock.exe` launched `VoIPClient.exe`, normal `GameClientMock.exe` exit asks that launched voice client to quit
+- If `GameClientMock.exe` attached to an already-running `VoIPClient.exe`, it does not automatically terminate that existing process; use `quit-client` when you explicitly want to close it
 - The public IPC name is the base name such as `RanOnlineVoIP`
 - Internally, the implementation uses separate one-way named pipes for stability, but that detail is hidden from the caller
 
-At startup, `GameClientMock.exe` connects to the local IPC port and requests current state automatically.
+At startup, `GameClientMock.exe` attaches to or starts the voice client, connects to the local IPC channel, and requests current state automatically.
 
 Useful commands:
 

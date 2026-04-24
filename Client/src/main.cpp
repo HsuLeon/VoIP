@@ -2,30 +2,18 @@
 #define NOMINMAX
 #include <windows.h>
 
-#include "VoIP/VoIP.h"
+#include "CVoIPClientApp.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <cstdlib>
-#include <fstream>
-#include <functional>
 #include <iostream>
-#include <mutex>
 #include <string>
 #include <thread>
 
 namespace {
 
 std::atomic<bool> g_running{true};
-constexpr int IPC_HEARTBEAT_TIMEOUT_MS = 10000;
-constexpr int IPC_SHUTDOWN_GRACE_MS = 5000;
-
-int64_t nowMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
 
 BOOL WINAPI consoleCtrlHandler(DWORD) {
     g_running = false;
@@ -53,11 +41,11 @@ struct Args {
 void printClientUsage() {
     std::cerr << "Usage:\n";
     std::cerr << "  IPC mode:\n";
-    std::cerr << "    Client.exe --ipc-type socket [--ipc-port 17832]\n";
-    std::cerr << "    Client.exe --ipc-type namedPipe [--ipc-name RanOnlineVoIP]\n";
+    std::cerr << "    VoIPClient.exe --ipc-type socket [--ipc-port 17832]\n";
+    std::cerr << "    VoIPClient.exe --ipc-type namedPipe [--ipc-name RanOnlineVoIP]\n";
     std::cerr << "\n";
     std::cerr << "  Direct startup mode:\n";
-    std::cerr << "    Client.exe --server 127.0.0.1:7000 --token test "
+    std::cerr << "    VoIPClient.exe --server 127.0.0.1:7000 --token test "
                  "--channel guild_123 --player playerA\n";
 }
 
@@ -137,255 +125,36 @@ bool hasCompleteJoinArgs(const Args& args) {
            args.channelProvided && args.playerProvided;
 }
 
-bool hasAnyJoinArgs(const Args& args) {
-    return args.serverProvided || args.tokenProvided ||
-           args.channelProvided || args.playerProvided;
-}
-
-bool fileExists(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    return static_cast<bool>(in);
-}
-
-std::string readTextFile(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return {};
-    return std::string((std::istreambuf_iterator<char>(in)),
-                       std::istreambuf_iterator<char>());
-}
-
-void writeDefaultClientConfigFile(const std::string& path,
-                                  const VoIP::ChannelConfig& cfg) {
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) return;
-
-    out << "{\n";
-    out << "  \"signalingServer\": \"" << cfg.signalingServer << "\",\n";
-    out << "  \"signalingPort\": " << cfg.signalingPort << ",\n";
-    out << "  \"token\": \"" << cfg.token << "\",\n";
-    out << "  \"channelId\": \"" << cfg.channelId << "\",\n";
-    out << "  \"playerId\": \"" << cfg.playerId << "\",\n";
-    out << "\n";
-    out << "  \"opusBitrate\": " << cfg.opusBitrate << ",\n";
-    out << "  \"captureVadDb\": " << cfg.captureVadDb << ",\n";
-    out << "  \"captureHangoverFrames\": " << cfg.captureHangoverFrames << ",\n";
-    out << "\n";
-    out << "  \"enableEchoCancel\": "
-        << (cfg.enableEchoCancel ? "true" : "false") << ",\n";
-    out << "  \"aecFilterMs\": " << cfg.aecFilterMs << ",\n";
-    out << "  \"aecEchoSuppress\": " << cfg.aecEchoSuppress << ",\n";
-    out << "  \"aecEchoSuppressActive\": " << cfg.aecEchoSuppressActive << ",\n";
-    out << "\n";
-    out << "  \"enableDenoise\": "
-        << (cfg.enableDenoise ? "true" : "false") << "\n";
-    out << "}\n";
-}
-
-std::string jStr(const std::string& j, const std::string& key) {
-    const std::string pat = "\"" + key + "\"";
-    const auto k = j.find(pat);
-    if (k == std::string::npos) return {};
-    const auto c = j.find(':', k + pat.size());
-    if (c == std::string::npos) return {};
-    const auto q1 = j.find('"', c + 1);
-    if (q1 == std::string::npos) return {};
-    const auto q2 = j.find('"', q1 + 1);
-    if (q2 == std::string::npos) return {};
-    return j.substr(q1 + 1, q2 - q1 - 1);
-}
-
-bool jBool(const std::string& j, const std::string& key, bool& out) {
-    const std::string pat = "\"" + key + "\"";
-    const auto k = j.find(pat);
-    if (k == std::string::npos) return false;
-    const auto c = j.find(':', k + pat.size());
-    if (c == std::string::npos) return false;
-    size_t v = c + 1;
-    while (v < j.size() &&
-           (j[v] == ' ' || j[v] == '\t' || j[v] == '\r' || j[v] == '\n')) {
-        ++v;
-    }
-    if (j.compare(v, 4, "true") == 0) {
-        out = true;
-        return true;
-    }
-    if (j.compare(v, 5, "false") == 0) {
-        out = false;
-        return true;
-    }
-    return false;
-}
-
-bool jInt(const std::string& j, const std::string& key, int& out) {
-    const std::string pat = "\"" + key + "\"";
-    const auto k = j.find(pat);
-    if (k == std::string::npos) return false;
-    const auto c = j.find(':', k + pat.size());
-    if (c == std::string::npos) return false;
-    size_t v = c + 1;
-    while (v < j.size() &&
-           (j[v] == ' ' || j[v] == '\t' || j[v] == '\r' || j[v] == '\n')) {
-        ++v;
-    }
-    char* end = nullptr;
-    const long val = std::strtol(j.c_str() + v, &end, 10);
-    if (end == j.c_str() + v) return false;
-    out = static_cast<int>(val);
-    return true;
-}
-
-bool jFloat(const std::string& j, const std::string& key, float& out) {
-    const std::string pat = "\"" + key + "\"";
-    const auto k = j.find(pat);
-    if (k == std::string::npos) return false;
-    const auto c = j.find(':', k + pat.size());
-    if (c == std::string::npos) return false;
-    size_t v = c + 1;
-    while (v < j.size() &&
-           (j[v] == ' ' || j[v] == '\t' || j[v] == '\r' || j[v] == '\n')) {
-        ++v;
-    }
-    char* end = nullptr;
-    const float val = std::strtof(j.c_str() + v, &end);
-    if (end == j.c_str() + v) return false;
-    out = val;
-    return true;
-}
-
-void applyClientConfigFile(VoIP::ChannelConfig& cfg, const std::string& path) {
-    if (!fileExists(path)) {
-        writeDefaultClientConfigFile(path, cfg);
-        return;
-    }
-
-    const std::string text = readTextFile(path);
-    if (text.empty()) return;
-
-    if (const auto v = jStr(text, "signalingServer"); !v.empty()) cfg.signalingServer = v;
-    if (int v; jInt(text, "signalingPort", v) && v > 0 && v <= 65535) cfg.signalingPort = static_cast<uint16_t>(v);
-    if (const auto v = jStr(text, "turnServer"); !v.empty()) cfg.turnServer = v;
-    if (int v; jInt(text, "turnPort", v) && v > 0 && v <= 65535) cfg.turnPort = static_cast<uint16_t>(v);
-    if (const auto v = jStr(text, "token"); !v.empty()) cfg.token = v;
-    if (const auto v = jStr(text, "channelId"); !v.empty()) cfg.channelId = v;
-    if (const auto v = jStr(text, "playerId"); !v.empty()) cfg.playerId = v;
-
-    if (int v; jInt(text, "opusBitrate", v) && v > 0) cfg.opusBitrate = v;
-    if (float v; jFloat(text, "captureVadDb", v)) cfg.captureVadDb = v;
-    if (int v; jInt(text, "captureHangoverFrames", v) && v >= 0) cfg.captureHangoverFrames = v;
-    if (int v; jInt(text, "aecFilterMs", v) && v > 0) cfg.aecFilterMs = v;
-    if (int v; jInt(text, "aecEchoSuppress", v)) cfg.aecEchoSuppress = v;
-    if (int v; jInt(text, "aecEchoSuppressActive", v)) cfg.aecEchoSuppressActive = v;
-    if (bool v; jBool(text, "enableEchoCancel", v)) cfg.enableEchoCancel = v;
-    if (bool v; jBool(text, "enableDenoise", v)) cfg.enableDenoise = v;
-}
-
-std::string jsonEscape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (char ch : s) {
-        switch (ch) {
-        case '\\': out += "\\\\"; break;
-        case '"': out += "\\\""; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default: out.push_back(ch); break;
+void printBanner(const CVoIPClientAppOptions& options) {
+    std::cout << "========================================\n";
+    std::cout << "  VoIP Client  [TEST BUILD]\n";
+    std::cout << "========================================\n";
+    if (options.ipcMode) {
+        std::cout << "  Mode    : IPC\n";
+        std::cout << "  IPC     : "
+                  << CVoIPClientApp::transportToText(options.ipcOptions.transport);
+        if (options.ipcOptions.transport == VoIP::IpcTransport::Socket) {
+            std::cout << " 127.0.0.1:" << options.ipcOptions.socketPort << "\n";
+        } else {
+            std::cout << " \\\\.\\pipe\\" << options.ipcOptions.pipeName << "\n";
         }
-    }
-    return out;
-}
-
-void appendJsonStringField(std::string& json, bool& first,
-                           const std::string& key, const std::string& value) {
-    if (!first) json += ",";
-    first = false;
-    json += "\"" + key + "\":\"" + jsonEscape(value) + "\"";
-}
-
-void appendJsonBoolField(std::string& json, bool& first,
-                         const std::string& key, bool value) {
-    if (!first) json += ",";
-    first = false;
-    json += "\"" + key + "\":" + std::string(value ? "true" : "false");
-}
-
-void appendJsonIntField(std::string& json, bool& first,
-                        const std::string& key, int value) {
-    if (!first) json += ",";
-    first = false;
-    json += "\"" + key + "\":" + std::to_string(value);
-}
-
-bool parseHostPort(const std::string& input,
-                   std::string& host,
-                   uint16_t& port) {
-    const auto colon = input.find(':');
-    if (colon == std::string::npos) {
-        host = input;
-        return !host.empty();
-    }
-
-    host = input.substr(0, colon);
-    int parsedPort = 0;
-    try {
-        parsedPort = std::stoi(input.substr(colon + 1));
-    } catch (...) {
-        return false;
-    }
-    if (parsedPort <= 0 || parsedPort > 65535) {
-        return false;
-    }
-    port = static_cast<uint16_t>(parsedPort);
-    return !host.empty();
-}
-
-bool parseIpcType(const std::string& text, VoIP::IpcTransport& out) {
-    if (text == "socket") {
-        out = VoIP::IpcTransport::Socket;
-        return true;
-    }
-    if (text == "namedPipe" || text == "namedpipe") {
-        out = VoIP::IpcTransport::NamedPipe;
-        return true;
-    }
-    return false;
-}
-
-std::string transportToText(VoIP::IpcTransport transport) {
-    return transport == VoIP::IpcTransport::Socket ? "socket" : "namedPipe";
-}
-
-std::string buildStateJson(const VoIP::ChannelConfig& cfg,
-                           bool joined,
-                           bool muted,
-                           const VoIP::IpcOptions& ipcOptions) {
-    std::string json = "{";
-    bool first = true;
-    appendJsonIntField(json, first, "ver", VoIP::IPC_VERSION);
-    appendJsonStringField(json, first, "evt", "STATE");
-    appendJsonStringField(json, first, "playerId", cfg.playerId);
-    appendJsonStringField(json, first, "channelId", cfg.channelId);
-    appendJsonStringField(json, first, "signalingServer", cfg.signalingServer);
-    appendJsonIntField(json, first, "signalingPort", cfg.signalingPort);
-    appendJsonBoolField(json, first, "joined", joined);
-    appendJsonBoolField(json, first, "muted", muted);
-    appendJsonStringField(json, first, "ipcType", transportToText(ipcOptions.transport));
-    if (ipcOptions.transport == VoIP::IpcTransport::Socket) {
-        appendJsonIntField(json, first, "ipcPort", ipcOptions.socketPort);
     } else {
-        appendJsonStringField(json, first, "ipcName", ipcOptions.pipeName);
+        std::cout << "  Mode    : Direct Startup\n";
+        std::cout << "  Server  : " << options.initialConfig.signalingServer
+                  << ":" << options.initialConfig.signalingPort << "\n";
+        std::cout << "  Channel : " << options.initialConfig.channelId << "\n";
+        std::cout << "  Player  : " << options.initialConfig.playerId << "\n";
     }
-    json += "}";
-    return json;
-}
-
-std::string buildSimpleEventJson(const std::string& evt) {
-    std::string json = "{";
-    bool first = true;
-    appendJsonIntField(json, first, "ver", VoIP::IPC_VERSION);
-    appendJsonStringField(json, first, "evt", evt);
-    json += "}";
-    return json;
+    std::cout << "========================================\n";
+    if (options.ipcMode) {
+        std::cout << "  Controlled by IPC game client\n";
+        std::cout << "  Heartbeat timeout: "
+                  << options.ipcHeartbeatTimeoutMs << " ms\n";
+    } else {
+        std::cout << "  q+Enter = quit\n";
+        std::cout << "  m+Enter = toggle mute\n";
+    }
+    std::cout << "========================================\n\n";
 }
 
 } // namespace
@@ -402,296 +171,37 @@ int main(int argc, char* argv[]) {
     const bool ipcMode = args.ipcRequested;
     const bool directMode = !args.ipcRequested && hasCompleteJoinArgs(args);
 
-    if (ipcMode == false && directMode == false) {
+    if (!ipcMode && !directMode) {
         printClientUsage();
         return 1;
     }
 
-    VoIP::IpcOptions ipcOptions;
+    CVoIPClientAppOptions options;
+    options.ipcMode = ipcMode;
+    options.autoJoinOnStart = directMode;
+    options.initialConfig.signalingServer = args.serverHost;
+    options.initialConfig.signalingPort = args.serverPort;
+    options.initialConfig.channelId = args.channelId;
+    options.initialConfig.playerId = args.playerId;
+    options.initialConfig.token = args.token;
+
     if (ipcMode) {
-        if (!parseIpcType(args.ipcType, ipcOptions.transport)) {
+        if (!CVoIPClientApp::parseIpcType(args.ipcType, options.ipcOptions.transport)) {
             std::cerr << "[WARN] Invalid --ipc-type value: " << args.ipcType << "\n";
             printClientUsage();
             return 1;
         }
-        ipcOptions.socketPort = args.ipcPort;
-        ipcOptions.pipeName = args.ipcName.empty()
-                                ? VoIP::IPC_DEFAULT_PIPE_NAME
-                                : args.ipcName;
+        options.ipcOptions.socketPort = args.ipcPort;
+        options.ipcOptions.pipeName =
+            args.ipcName.empty() ? VoIP::IPC_DEFAULT_PIPE_NAME : args.ipcName;
     }
 
-    std::cout << "========================================\n";
-    std::cout << "  VoIP Client  [TEST BUILD]\n";
-    std::cout << "========================================\n";
-    if (ipcMode) {
-        std::cout << "  Mode    : IPC\n";
-        std::cout << "  IPC     : " << transportToText(ipcOptions.transport);
-        if (ipcOptions.transport == VoIP::IpcTransport::Socket) {
-            std::cout << " 127.0.0.1:" << ipcOptions.socketPort << "\n";
-        } else {
-            std::cout << " \\\\.\\pipe\\" << ipcOptions.pipeName << "\n";
-        }
-    } else {
-        std::cout << "  Mode    : Direct Startup\n";
-        std::cout << "  Server  : " << args.serverHost << ":" << args.serverPort << "\n";
-        std::cout << "  Channel : " << args.channelId << "\n";
-        std::cout << "  Player  : " << args.playerId << "\n";
-    }
-    std::cout << "========================================\n";
-    if (ipcMode) {
-        std::cout << "  Controlled by IPC game client\n";
-        std::cout << "  Heartbeat timeout: " << IPC_HEARTBEAT_TIMEOUT_MS << " ms\n";
-    } else {
-        std::cout << "  q+Enter = quit\n";
-        std::cout << "  m+Enter = toggle mute\n";
-    }
-    std::cout << "========================================\n\n";
+    CVoIPClientApp::applyClientConfigFile(options.initialConfig, "client_config.json");
+    printBanner(options);
 
-    VoIP::Channel channel;
-    VoIP::ChannelConfig cfg;
-    cfg.signalingServer = args.serverHost;
-    cfg.signalingPort = args.serverPort;
-    cfg.channelId = args.channelId;
-    cfg.playerId = args.playerId;
-    cfg.token = args.token;
-    applyClientConfigFile(cfg, "client_config.json");
-
-    std::mutex channelMtx;
-    std::mutex cfgMtx;
-    std::atomic<bool> joined{false};
-    std::atomic<int64_t> lastIpcHeartbeatMs{nowMs()};
-
-    VoIP::IpcServer ipc;
-    const auto sendIpc = [&](const std::string& json) {
-        if (ipcMode) {
-            ipc.send(json);
-        }
-    };
-
-    const auto sendState = [&]() {
-        if (!ipcMode) return;
-        std::scoped_lock lock(channelMtx, cfgMtx);
-        sendIpc(buildStateJson(cfg, joined.load(), channel.isMuted(), ipcOptions));
-    };
-
-    VoIP::ChannelEvents ev;
-    ev.onPeerJoined = [&](const std::string& id) {
-        std::cout << "[+] Peer joined  : " << id << "\n";
-        if (!ipcMode) return;
-        std::string json = "{";
-        bool first = true;
-        appendJsonIntField(json, first, "ver", VoIP::IPC_VERSION);
-        appendJsonStringField(json, first, "evt", "PEER_JOIN");
-        appendJsonStringField(json, first, "playerId", id);
-        json += "}";
-        sendIpc(json);
-    };
-
-    ev.onPeerLeft = [&](const std::string& id) {
-        std::cout << "[-] Peer left    : " << id << "\n";
-        if (!ipcMode) return;
-        std::string json = "{";
-        bool first = true;
-        appendJsonIntField(json, first, "ver", VoIP::IPC_VERSION);
-        appendJsonStringField(json, first, "evt", "PEER_LEAVE");
-        appendJsonStringField(json, first, "playerId", id);
-        json += "}";
-        sendIpc(json);
-    };
-
-    ev.onSpeakingChanged = [&](const std::string& id, bool speaking) {
-#ifdef _DEBUG
-        std::cout << "[~] " << id
-                  << (speaking ? " >> SPEAKING" : "    silent") << "\n";
-#endif
-        if (!ipcMode) return;
-        std::string json = "{";
-        bool first = true;
-        appendJsonIntField(json, first, "ver", VoIP::IPC_VERSION);
-        appendJsonStringField(json, first, "evt", "SPEAKING");
-        appendJsonStringField(json, first, "playerId", id);
-        appendJsonBoolField(json, first, "speaking", speaking);
-        json += "}";
-        sendIpc(json);
-    };
-
-    ev.onError = [&](const std::string& msg) {
-        std::cerr << "[ERR] " << msg << "\n";
-        if (!ipcMode) return;
-        std::string json = "{";
-        bool first = true;
-        appendJsonIntField(json, first, "ver", VoIP::IPC_VERSION);
-        appendJsonStringField(json, first, "evt", "ERROR");
-        appendJsonStringField(json, first, "message", msg);
-        json += "}";
-        sendIpc(json);
-    };
-
-    const auto joinCurrentConfig = [&](const std::string& reason) -> bool {
-        std::scoped_lock lock(channelMtx, cfgMtx);
-
-        if (joined.load()) {
-            channel.leave();
-            joined = false;
-        }
-
-        std::cout << "[*] Joining channel";
-        if (!reason.empty()) {
-            std::cout << " (" << reason << ")";
-        }
-        std::cout << "...\n";
-
-        if (!channel.join(cfg, ev)) {
-            std::cerr << "[!] join() failed. Check server is running.\n";
-            return false;
-        }
-
-        joined = true;
-        std::cout << "[*] Joined! Microphone active.\n";
-        return true;
-    };
-
-    if (ipcMode) {
-        if (!ipc.start(ipcOptions, [&](const std::string& jsonMsg) {
-                const std::string cmd = jStr(jsonMsg, "cmd");
-                if (cmd.empty()) return;
-
-                if (cmd == "HEARTBEAT") {
-                    lastIpcHeartbeatMs = nowMs();
-                    return;
-                }
-
-                if (cmd == "HELLO") {
-                    lastIpcHeartbeatMs = nowMs();
-                    sendIpc(buildSimpleEventJson("READY"));
-                    sendState();
-                    return;
-                }
-
-                if (cmd == "STATUS") {
-                    sendState();
-                    return;
-                }
-
-                if (cmd == "LOGIN") {
-                    {
-                        std::lock_guard<std::mutex> cfgLock(cfgMtx);
-
-                        if (const auto v = jStr(jsonMsg, "server"); !v.empty()) {
-                            std::string host = cfg.signalingServer;
-                            uint16_t port = cfg.signalingPort;
-                            if (parseHostPort(v, host, port)) {
-                                cfg.signalingServer = host;
-                                cfg.signalingPort = port;
-                            }
-                        }
-                        if (const auto v = jStr(jsonMsg, "signalingServer"); !v.empty()) {
-                            cfg.signalingServer = v;
-                        }
-                        if (int v; jInt(jsonMsg, "signalingPort", v) &&
-                                   v > 0 && v <= 65535) {
-                            cfg.signalingPort = static_cast<uint16_t>(v);
-                        }
-                        if (const auto v = jStr(jsonMsg, "token"); !v.empty()) {
-                            cfg.token = v;
-                        }
-                        if (const auto v = jStr(jsonMsg, "playerId"); !v.empty()) {
-                            cfg.playerId = v;
-                        }
-                        if (const auto v = jStr(jsonMsg, "channelId"); !v.empty()) {
-                            cfg.channelId = v;
-                        }
-                    }
-
-                    sendIpc(buildSimpleEventJson("LOGIN_APPLIED"));
-                    sendState();
-                    return;
-                }
-
-                if (cmd == "JOIN") {
-                    {
-                        std::lock_guard<std::mutex> cfgLock(cfgMtx);
-                        if (const auto v = jStr(jsonMsg, "channelId"); !v.empty()) {
-                            cfg.channelId = v;
-                        }
-                        if (const auto v = jStr(jsonMsg, "playerId"); !v.empty()) {
-                            cfg.playerId = v;
-                        }
-                        if (const auto v = jStr(jsonMsg, "token"); !v.empty()) {
-                            cfg.token = v;
-                        }
-                        if (const auto v = jStr(jsonMsg, "server"); !v.empty()) {
-                            std::string host = cfg.signalingServer;
-                            uint16_t port = cfg.signalingPort;
-                            if (parseHostPort(v, host, port)) {
-                                cfg.signalingServer = host;
-                                cfg.signalingPort = port;
-                            }
-                        }
-                    }
-
-                    if (joinCurrentConfig("IPC")) {
-                        sendIpc(buildSimpleEventJson("JOINED"));
-                    }
-                    sendState();
-                    return;
-                }
-
-                if (cmd == "LEAVE") {
-                    {
-                        std::lock_guard<std::mutex> channelLock(channelMtx);
-                        if (joined.load()) {
-                            channel.leave();
-                            joined = false;
-                            std::cout << "[*] Left channel from IPC.\n";
-                        }
-                    }
-                    sendIpc(buildSimpleEventJson("LEFT"));
-                    sendState();
-                    return;
-                }
-
-                if (cmd == "MUTE") {
-                    bool muted = false;
-                    if (!jBool(jsonMsg, "muted", muted)) return;
-                    {
-                        std::lock_guard<std::mutex> channelLock(channelMtx);
-                        channel.setMuted(muted);
-                    }
-                    std::cout << (muted ? "[MIC] Muted\n" : "[MIC] Unmuted\n");
-                    sendIpc(buildSimpleEventJson("MUTE_CHANGED"));
-                    sendState();
-                    return;
-                }
-
-                if (cmd == "TOGGLE_MUTE") {
-                    bool muted = false;
-                    {
-                        std::lock_guard<std::mutex> channelLock(channelMtx);
-                        muted = !channel.isMuted();
-                        channel.setMuted(muted);
-                    }
-                    std::cout << (muted ? "[MIC] Muted\n" : "[MIC] Unmuted\n");
-                    sendIpc(buildSimpleEventJson("MUTE_CHANGED"));
-                    sendState();
-                    return;
-                }
-
-                if (cmd == "QUIT") {
-                    g_running = false;
-                }
-            })) {
-            std::cerr << "[ERR] Failed to start IPC transport.\n";
-            printClientUsage();
-            return 1;
-        }
-
-        std::cout << "[*] Running in IPC mode.\n";
-        std::cout << "[*] Waiting for game client commands.\n";
-    } else {
-        if (!joinCurrentConfig("startup")) {
-            return 1;
-        }
+    CVoIPClientApp app;
+    if (!app.start(options)) {
+        return 1;
     }
 
     std::thread inputThread;
@@ -700,14 +210,9 @@ int main(int argc, char* argv[]) {
             std::string line;
             while (g_running && std::getline(std::cin, line)) {
                 if (line == "m" || line == "M") {
-                    bool muted = false;
-                    {
-                        std::lock_guard<std::mutex> channelLock(channelMtx);
-                        muted = !channel.isMuted();
-                        channel.setMuted(muted);
-                    }
-                    std::cout << (muted ? "[MIC] Muted\n" : "[MIC] Unmuted\n");
+                    app.toggleMuted();
                 } else if (line == "q" || line == "Q" || line == "quit") {
+                    app.requestQuit();
                     g_running = false;
                     break;
                 }
@@ -717,63 +222,13 @@ int main(int argc, char* argv[]) {
     }
 
     auto nextTick = std::chrono::steady_clock::now();
-    while (g_running) {
-        if (ipcMode &&
-            nowMs() - lastIpcHeartbeatMs.load() > IPC_HEARTBEAT_TIMEOUT_MS) {
-            std::cerr << "[ERR] IPC heartbeat timeout. Closing VoIP client.\n";
-            g_running = false;
-            break;
-        }
-
-        {
-            std::lock_guard<std::mutex> channelLock(channelMtx);
-            channel.tick();
-        }
+    while (g_running && app.isRunning()) {
+        app.tick();
         nextTick += std::chrono::milliseconds(20);
         std::this_thread::sleep_until(nextTick);
     }
 
-    const auto shutdownWork = [&]() {
-        std::cout << "\n[*] Leaving channel...\n";
-        {
-            std::lock_guard<std::mutex> channelLock(channelMtx);
-            if (joined.load()) {
-                channel.leave();
-                joined = false;
-            }
-        }
-        if (ipcMode) {
-            ipc.stop();
-        }
-        std::cout << "[*] Done.\n";
-    };
-
-    if (ipcMode) {
-        std::atomic<bool> shutdownDone{false};
-        std::thread shutdownThread([&]() {
-            shutdownWork();
-            shutdownDone = true;
-        });
-
-        const auto deadline =
-            std::chrono::steady_clock::now() +
-            std::chrono::milliseconds(IPC_SHUTDOWN_GRACE_MS);
-        while (!shutdownDone.load() &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-
-        if (!shutdownDone.load()) {
-            std::cerr << "[ERR] IPC shutdown grace period exceeded. Forcing VoIP client exit.\n";
-            ExitProcess(0);
-        }
-
-        if (shutdownThread.joinable()) {
-            shutdownThread.join();
-        }
-    } else {
-        shutdownWork();
-    }
+    app.stop();
 
     if (inputThread.joinable()) {
         inputThread.join();

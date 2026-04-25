@@ -225,6 +225,11 @@ std::string buildSimpleEventJson(const std::string& evt) {
 
 } // namespace
 
+CVoIPClientApp& CVoIPClientApp::instance() {
+    static CVoIPClientApp instance;
+    return instance;
+}
+
 CVoIPClientApp::CVoIPClientApp() = default;
 
 CVoIPClientApp::~CVoIPClientApp() {

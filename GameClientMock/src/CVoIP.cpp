@@ -97,6 +97,11 @@ HANDLE asHandle(void* handle) {
 
 } // namespace
 
+CVoIP& CVoIP::instance() {
+    static CVoIP instance;
+    return instance;
+}
+
 CVoIP::CVoIP() = default;
 
 CVoIP::~CVoIP() {

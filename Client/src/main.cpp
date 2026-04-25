@@ -199,7 +199,7 @@ int main(int argc, char* argv[]) {
     CVoIPClientApp::applyClientConfigFile(options.initialConfig, "client_config.json");
     printBanner(options);
 
-    CVoIPClientApp app;
+    auto& app = CVoIPClientApp::instance();
     if (!app.start(options)) {
         return 1;
     }

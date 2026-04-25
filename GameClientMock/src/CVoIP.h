@@ -18,8 +18,7 @@ struct CVoIPOptions {
 
 class CVoIP {
 public:
-    CVoIP();
-    ~CVoIP();
+    static CVoIP& instance();
 
     CVoIP(const CVoIP&) = delete;
     CVoIP& operator=(const CVoIP&) = delete;
@@ -40,6 +39,9 @@ public:
     void quitClient();
 
 private:
+    CVoIP();
+    ~CVoIP();
+
     struct ChildProcess {
         void* process = nullptr;
         void* thread = nullptr;

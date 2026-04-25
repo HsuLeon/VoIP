@@ -134,7 +134,7 @@ int main(int argc, char* argv[]) {
               << (args.voip.showVoipConsole ? "show console" : "hide console") << "\n";
     std::cout << "========================================\n";
 
-    CVoIP voip;
+    auto& voip = CVoIP::instance();
     if (!voip.start(args.voip)) {
         return 1;
     }

@@ -203,9 +203,11 @@ The solution now also includes:
 - `GameClientMock`
   A console project that simulates the future game client and talks to `VoIPClient.exe` through local IPC
 - `GameClientMock/src/CVoIP.*`
-  A small wrapper used by the mock game client to own VoIPClient launch/attach, IPC commands, heartbeat, and shutdown behavior
+  A singleton wrapper used by the mock game client to own VoIPClient launch/attach, IPC commands, heartbeat, and shutdown behavior
 - `Client/src/CVoIPClientApp.*`
-  A reusable wrapper that owns the current VoIP client runtime: channel lifecycle, IPC server, heartbeat timeout, state/event forwarding, config application, mute/join/leave control, and shutdown flow
+  A singleton wrapper that owns the current VoIP client runtime: channel lifecycle, IPC server, heartbeat timeout, state/event forwarding, config application, mute/join/leave control, and shutdown flow
+- `Server/src/CVoIPServer.*`
+  A singleton wrapper that owns the current VoIP server runtime: signaling accept loop, UDP relay loop, heartbeat/ping management, session map, and shutdown flow
 
 IPC is currently implemented as a transport-selectable local channel:
 

@@ -26,8 +26,7 @@ struct CVoIPClientAppOptions {
 
 class CVoIPClientApp {
 public:
-    CVoIPClientApp();
-    ~CVoIPClientApp();
+    static CVoIPClientApp& instance();
 
     CVoIPClientApp(const CVoIPClientApp&) = delete;
     CVoIPClientApp& operator=(const CVoIPClientApp&) = delete;
@@ -59,6 +58,9 @@ public:
                                       const std::string& path);
 
 private:
+    CVoIPClientApp();
+    ~CVoIPClientApp();
+
     void setupChannelEvents();
     void handleIpcMessage(const std::string& jsonMsg);
     void sendIpc(const std::string& jsonMsg);

@@ -1,6 +1,8 @@
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 #include "CVoIP.h"
 
@@ -10,19 +12,22 @@
 #include <thread>
 #include <vector>
 
+#pragma comment(lib, "ws2_32.lib")
+
 namespace {
 
 constexpr int HEARTBEAT_INTERVAL_MS = 1000;
+constexpr SOCKET INVALID_SOCKET_VALUE = INVALID_SOCKET;
 
-std::string transportToText(VoIP::IpcTransport transport) {
-    return transport == VoIP::IpcTransport::Socket ? "socket" : "namedPipe";
+std::string transportToText(CVoIPIpcOptions::Transport transport) {
+    return transport == CVoIPIpcOptions::Transport::Socket ? "socket" : "namedPipe";
 }
 
 std::string makePipePath(const std::string& pipeName, const char* suffix) {
     return "\\\\.\\pipe\\" + pipeName + suffix;
 }
 
-bool namedPipeEndpointExists(const VoIP::IpcOptions& ipc) {
+bool namedPipeEndpointExists(const CVoIPIpcOptions& ipc) {
     const std::string c2s = makePipePath(ipc.pipeName, ".c2s");
     const std::string s2c = makePipePath(ipc.pipeName, ".s2c");
     return WaitNamedPipeA(c2s.c_str(), 50) || WaitNamedPipeA(s2c.c_str(), 50);
@@ -65,7 +70,7 @@ std::string buildVoipClientCommandLine(const std::string& exePath,
     std::string cmd = quoteArg(exePath);
     cmd += " --ipc-type ";
     cmd += transportToText(options.ipc.transport);
-    if (options.ipc.transport == VoIP::IpcTransport::Socket) {
+    if (options.ipc.transport == CVoIPIpcOptions::Transport::Socket) {
         cmd += " --ipc-port ";
         cmd += std::to_string(options.ipc.socketPort);
     } else {
@@ -93,6 +98,92 @@ std::string jsonEscape(const std::string& s) {
 
 HANDLE asHandle(void* handle) {
     return static_cast<HANDLE>(handle);
+}
+
+bool sendSocketAll(SOCKET sock, const std::string& jsonMsg) {
+    const std::string msg = (!jsonMsg.empty() && jsonMsg.back() == '\n') ? jsonMsg : (jsonMsg + "\n");
+    int sent = 0;
+    const int total = static_cast<int>(msg.size());
+    while (sent < total) {
+        const int n = ::send(sock, msg.c_str() + sent, total - sent, 0);
+        if (n <= 0) return false;
+        sent += n;
+    }
+    return true;
+}
+
+bool sendPipeAll(HANDLE pipe, const std::string& jsonMsg) {
+    const std::string msg = (!jsonMsg.empty() && jsonMsg.back() == '\n') ? jsonMsg : (jsonMsg + "\n");
+    DWORD totalWritten = 0;
+    while (totalWritten < msg.size()) {
+        DWORD written = 0;
+        const BOOL ok = WriteFile(pipe,
+                                  msg.data() + totalWritten,
+                                  static_cast<DWORD>(msg.size() - totalWritten),
+                                  &written,
+                                  nullptr);
+        if (!ok || written == 0) return false;
+        totalWritten += written;
+    }
+    return true;
+}
+
+bool openClientPipeWithRetry(const std::string& path, DWORD desiredAccess, HANDLE& outHandle) {
+    for (int i = 0; i < 30; ++i) {
+        if (WaitNamedPipeA(path.c_str(), 200)) {
+            outHandle = CreateFileA(path.c_str(), desiredAccess, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (outHandle != INVALID_HANDLE_VALUE) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool recvSocketLine(SOCKET sock, std::string& lineBuf, std::string& remaining) {
+    auto pos = remaining.find('\n');
+    if (pos != std::string::npos) {
+        lineBuf = remaining.substr(0, pos);
+        remaining = remaining.substr(pos + 1);
+        return true;
+    }
+
+    char buf[4096];
+    while (true) {
+        const int n = recv(sock, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) return false;
+        buf[n] = '\0';
+        remaining += buf;
+        pos = remaining.find('\n');
+        if (pos != std::string::npos) {
+            lineBuf = remaining.substr(0, pos);
+            remaining = remaining.substr(pos + 1);
+            return true;
+        }
+    }
+}
+
+bool recvPipeLine(HANDLE pipe, std::string& lineBuf, std::string& remaining) {
+    auto pos = remaining.find('\n');
+    if (pos != std::string::npos) {
+        lineBuf = remaining.substr(0, pos);
+        remaining = remaining.substr(pos + 1);
+        return true;
+    }
+
+    char buf[4096];
+    while (true) {
+        DWORD bytesRead = 0;
+        const BOOL ok = ReadFile(pipe, buf, sizeof(buf), &bytesRead, nullptr);
+        if (!ok || bytesRead == 0) return false;
+        remaining.append(buf, buf + bytesRead);
+        pos = remaining.find('\n');
+        if (pos != std::string::npos) {
+            lineBuf = remaining.substr(0, pos);
+            remaining = remaining.substr(pos + 1);
+            return true;
+        }
+    }
 }
 
 } // namespace
@@ -144,7 +235,7 @@ void CVoIP::stop() {
         quitClient();
     }
 
-    m_ipc.disconnect();
+    disconnectIpc();
 
     if (m_quitSent.load() && m_child.launched) {
         WaitForSingleObject(asHandle(m_child.process), 2000);
@@ -205,15 +296,13 @@ void CVoIP::quitClient() {
 }
 
 bool CVoIP::tryConnectExistingIpc() {
-    if (m_options.ipc.transport == VoIP::IpcTransport::NamedPipe &&
+    if (m_options.ipc.transport == CVoIPIpcOptions::Transport::NamedPipe &&
         !namedPipeEndpointExists(m_options.ipc)) {
         return false;
     }
 
     std::cout << "[*] Checking for existing VoIPClient IPC...\n";
-    return m_ipc.connect(m_options.ipc, [](const std::string& json) {
-        std::cout << "[IPC-EVT] " << json << "\n";
-    });
+    return connectIpc();
 }
 
 bool CVoIP::launchVoipClient() {
@@ -272,19 +361,99 @@ bool CVoIP::connectLaunchedIpc() {
         }
 
         ++attempt;
-        if (m_ipc.connect(m_options.ipc, [](const std::string& json) {
-                std::cout << "[IPC-EVT] " << json << "\n";
-            })) {
+        if (connectIpc()) {
             if (attempt > 1) {
                 std::cout << "[*] Connected to launched VoIPClient IPC after retry.\n";
             }
             return true;
         }
 
-        Sleep(m_options.ipc.transport == VoIP::IpcTransport::NamedPipe ? 250 : 100);
+        Sleep(m_options.ipc.transport == CVoIPIpcOptions::Transport::NamedPipe ? 250 : 100);
     }
 
     return false;
+}
+
+bool CVoIP::connectIpc() {
+    disconnectIpc();
+
+    if (m_options.ipc.transport == CVoIPIpcOptions::Transport::Socket) {
+        WSADATA wsaData{};
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+            return false;
+        }
+        m_wsaStarted = true;
+
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) {
+            disconnectIpc();
+            return false;
+        }
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(m_options.ipc.socketPort);
+
+        if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            closesocket(sock);
+            disconnectIpc();
+            return false;
+        }
+
+        m_socket = static_cast<uintptr_t>(sock);
+        startReceiveLoop();
+        return true;
+    }
+
+    const std::string rxPath = makePipePath(m_options.ipc.pipeName, ".s2c");
+    const std::string txPath = makePipePath(m_options.ipc.pipeName, ".c2s");
+    HANDLE readPipe = INVALID_HANDLE_VALUE;
+    HANDLE writePipe = INVALID_HANDLE_VALUE;
+    if (!openClientPipeWithRetry(rxPath, GENERIC_READ, readPipe) ||
+        !openClientPipeWithRetry(txPath, GENERIC_WRITE, writePipe)) {
+        if (readPipe != INVALID_HANDLE_VALUE) CloseHandle(readPipe);
+        if (writePipe != INVALID_HANDLE_VALUE) CloseHandle(writePipe);
+        disconnectIpc();
+        return false;
+    }
+
+    m_pipeRead = readPipe;
+    m_pipeWrite = writePipe;
+    startReceiveLoop();
+    return true;
+}
+
+void CVoIP::disconnectIpc() {
+    m_running = false;
+
+    if (m_recvThread.joinable()) {
+        CancelSynchronousIo(m_recvThread.native_handle());
+    }
+
+    if (m_socket != static_cast<uintptr_t>(INVALID_SOCKET_VALUE)) {
+        closesocket(static_cast<SOCKET>(m_socket));
+        m_socket = static_cast<uintptr_t>(INVALID_SOCKET_VALUE);
+    }
+    if (m_pipeRead) {
+        CloseHandle(asHandle(m_pipeRead));
+        m_pipeRead = nullptr;
+    }
+    if (m_pipeWrite) {
+        CloseHandle(asHandle(m_pipeWrite));
+        m_pipeWrite = nullptr;
+    }
+
+    if (m_recvThread.joinable()) {
+        m_recvThread.join();
+    }
+
+    if (m_wsaStarted) {
+        WSACleanup();
+        m_wsaStarted = false;
+    }
+
+    m_recvRemainder.clear();
 }
 
 bool CVoIP::isChildRunning() const {
@@ -323,6 +492,36 @@ void CVoIP::stopHeartbeat() {
     }
 }
 
+void CVoIP::startReceiveLoop() {
+    m_running = true;
+    m_recvThread = std::thread([this]() {
+        std::string line;
+        while (m_running.load()) {
+            bool ok = false;
+            if (m_options.ipc.transport == CVoIPIpcOptions::Transport::Socket) {
+                ok = recvSocketLine(static_cast<SOCKET>(m_socket), line, m_recvRemainder);
+            } else if (m_pipeRead) {
+                ok = recvPipeLine(asHandle(m_pipeRead), line, m_recvRemainder);
+            }
+
+            if (!ok) {
+                break;
+            }
+
+            if (!line.empty()) {
+                std::cout << "[IPC-EVT] " << line << "\n";
+            }
+        }
+    });
+}
+
 void CVoIP::sendRaw(const std::string& json) {
-    m_ipc.send(json);
+    if (m_options.ipc.transport == CVoIPIpcOptions::Transport::Socket) {
+        if (m_socket == static_cast<uintptr_t>(INVALID_SOCKET_VALUE)) return;
+        sendSocketAll(static_cast<SOCKET>(m_socket), json);
+        return;
+    }
+
+    if (!m_pipeWrite) return;
+    sendPipeAll(asHandle(m_pipeWrite), json);
 }

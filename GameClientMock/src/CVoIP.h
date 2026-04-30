@@ -1,13 +1,26 @@
-#pragma once
-
-#include "VoIP/VoIP.h"
+﻿#pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <string>
 #include <thread>
 
+struct CVoIPIpcOptions {
+    enum class Transport {
+        Socket,
+        NamedPipe
+    };
+
+    static constexpr uint16_t DEFAULT_SOCKET_PORT = 17832;
+    static constexpr const char* DEFAULT_PIPE_NAME = "RanOnlineVoIP";
+
+    Transport transport = Transport::Socket;
+    uint16_t socketPort = DEFAULT_SOCKET_PORT;
+    std::string pipeName = DEFAULT_PIPE_NAME;
+};
+
 struct CVoIPOptions {
-    VoIP::IpcOptions ipc;
+    CVoIPIpcOptions ipc;
 
 #ifdef _DEBUG
     bool showVoipConsole = true;
@@ -51,17 +64,25 @@ private:
     bool tryConnectExistingIpc();
     bool launchVoipClient();
     bool connectLaunchedIpc();
+    bool connectIpc();
+    void disconnectIpc();
     bool isChildRunning() const;
     void terminateChildIfRunning();
     void closeChildHandles();
     void startHeartbeat();
     void stopHeartbeat();
     void sendRaw(const std::string& json);
+    void startReceiveLoop();
 
     CVoIPOptions m_options;
-    VoIP::IpcClient m_ipc;
     ChildProcess m_child;
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_quitSent{false};
     std::thread m_heartbeatThread;
+    std::thread m_recvThread;
+    void* m_pipeRead = nullptr;
+    void* m_pipeWrite = nullptr;
+    uintptr_t m_socket = static_cast<uintptr_t>(~0ULL);
+    bool m_wsaStarted = false;
+    std::string m_recvRemainder;
 };

@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 
@@ -29,20 +29,20 @@ void printUsage() {
     std::cerr << "  GameClientMock.exe --ipc-type namedPipe [--ipc-name RanOnlineVoIP] [--show-voip-console|--hide-voip-console]\n";
 }
 
-bool parseIpcType(const std::string& text, VoIP::IpcTransport& out) {
+bool parseIpcType(const std::string& text, CVoIPIpcOptions::Transport& out) {
     if (text == "socket") {
-        out = VoIP::IpcTransport::Socket;
+        out = CVoIPIpcOptions::Transport::Socket;
         return true;
     }
     if (text == "namedPipe" || text == "namedpipe") {
-        out = VoIP::IpcTransport::NamedPipe;
+        out = CVoIPIpcOptions::Transport::NamedPipe;
         return true;
     }
     return false;
 }
 
-std::string transportToText(VoIP::IpcTransport transport) {
-    return transport == VoIP::IpcTransport::Socket ? "socket" : "namedPipe";
+std::string transportToText(CVoIPIpcOptions::Transport transport) {
+    return transport == CVoIPIpcOptions::Transport::Socket ? "socket" : "namedPipe";
 }
 
 Args parseArgs(int argc, char* argv[]) {
@@ -125,7 +125,7 @@ int main(int argc, char* argv[]) {
     std::cout << "========================================\n";
     std::cout << "  GameClientMock\n";
     std::cout << "  IPC type : " << transportToText(args.voip.ipc.transport) << "\n";
-    if (args.voip.ipc.transport == VoIP::IpcTransport::Socket) {
+    if (args.voip.ipc.transport == CVoIPIpcOptions::Transport::Socket) {
         std::cout << "  Target   : 127.0.0.1:" << args.voip.ipc.socketPort << "\n";
     } else {
         std::cout << "  Target   : \\\\.\\pipe\\" << args.voip.ipc.pipeName << "\n";
